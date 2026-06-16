@@ -1,7 +1,10 @@
 # Wazuh App Copyright (C) 2017, Wazuh Inc. (License GPLv2)
 services:
   wazuh.manager:
-    image: wazuh/wazuh-manager:4.14.4
+    # image: wazuh/wazuh-manager:4.14.4
+    build:
+      context: ./wazuh-manager            # folder containing Dockerfile + patch scripts
+      dockerfile: Dockerfile
     hostname: wazuh.manager
     restart: always
     ulimits:
