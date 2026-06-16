@@ -3,7 +3,8 @@ server.port: 5601
 opensearch.hosts: https://wazuh.indexer:9200
 opensearch.ssl.verificationMode: certificate
 opensearch.requestHeadersWhitelist: ["securitytenant","Authorization"]
-opensearch_security.multitenancy.enabled: false
+opensearch_security.multitenancy.enabled: true
+opensearch_security.multitenancy.tenants.preferred: ["Global", "Private"]
 opensearch_security.readonly_mode.roles: ["kibana_read_only"]
 server.ssl.enabled: true
 server.ssl.key: "/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem"
@@ -14,3 +15,12 @@ uiSettings.overrides.defaultRoute: /app/wz-home
 opensearch_security.cookie.ttl: 900000
 opensearch_security.session.ttl: 900000
 opensearch_security.session.keepalive: true
+opensearch_security.ui.basicauth.login.brandimage: "/ui/custom/wazuh.svg"
+opensearchDashboards.branding:
+  logo:
+    defaultUrl: "/ui/custom/wazuh.svg"
+    darkModeUrl: "/ui/custom/wazuh.svg"
+  loadingLogo:
+    defaultUrl: "/ui/custom/detect.svg"
+    darkModeUrl: "/ui/custom/detect.svg"
+  applicationTitle: "Detect - Protect - Respond"
