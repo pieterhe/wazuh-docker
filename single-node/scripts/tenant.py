@@ -150,7 +150,7 @@ def tenant_from_role(role):
 
 def get_agent_ids_for_group(tenant):
     """Get all agent IDs that belong to the tenant group."""
-    result = wazuh("GET", f"/agents?groups_list={group_name(tenant)}&limit=500")
+    result = wazuh("GET", f"/agents?group={group_name(tenant)}&limit=500")
     agents = result.get("data", {}).get("affected_items", [])
     return [a["id"] for a in agents]
 
@@ -201,12 +201,12 @@ def update_kibana_alerts_pattern(username, tenant):
     result = indexer("POST", f"/{kibana_index}/_update/index-pattern:wazuh-alerts-*", {
         "doc": {
             "index-pattern": {
-                "title": f"wazuh-alerts-4.x-{tenant}-*"
+                "title": f"wazuh-alerts-4.x-{group_name(tenant)}-*"
             }
         }
     })
     if result.get("result") in ("updated", "noop"):
-        ok(f"Kibana alerts index pattern updated to 'wazuh-alerts-4.x-{tenant}-*'")
+        ok(f"Kibana alerts index pattern updated to 'wazuh-alerts-4.x-{group_name(tenant)}-*'")
         return True
     else:
         log(f"Note: {result}")
