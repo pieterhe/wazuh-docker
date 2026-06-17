@@ -7,7 +7,7 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
  COMMANDS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   sudo python3 tenant.py create-tenant <tenant_name>
-  sudo python3 tenant.py add-user <tenant_name> <username> <password>
+  sudo python3 tenant.py add-user <tenant_name> <username>
   sudo python3 tenant.py remove-user <tenant_name> <username>
   sudo python3 tenant.py delete-tenant <tenant_name>
   sudo python3 tenant.py list-tenants
@@ -26,7 +26,7 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
       - Wazuh API policy, role and rule scoped to the group
 
  2. Add a dashboard user:
-      sudo python3 tenant.py add-user <tenant_name> <username> <password>
+      sudo python3 tenant.py add-user <tenant_name> <username>
     Creates the OpenSearch user and maps them to the tenant role.
 
  3. Enroll agents into the tenant group:
@@ -442,7 +442,50 @@ def sync_role(tenant):
 
 
 # ── add-user ──────────────────────────────────────────────────
-def add_user(tenant, username, password):
+def generate_password():
+    """Generate a strong random password."""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + "!@#%^&*"
+    # Ensure at least one of each required type
+    while True:
+        pwd = ''.join(secrets.choice(alphabet) for _ in range(20))
+        if (any(c.islower() for c in pwd) and
+            any(c.isupper() for c in pwd) and
+            any(c.isdigit() for c in pwd) and
+            any(c in "!@#%^&*" for c in pwd)):
+            return pwd
+
+
+def trigger_kibana_login(username, password, tenant):
+    """Log in as the user to trigger kibana space creation."""
+    import time
+    log(f"Triggering login for '{username}' to initialize kibana space ...")
+    inner = (
+        f'curl -sk -X POST '
+        f'-H "Content-Type: application/json" '
+        f'-H "osd-xsrf: true" '
+        f'-H "securitytenant: tenant_{tenant}" '
+        f'-c /tmp/kibana_cookie_{username} '
+        f'-d '{{"username": "{username}", "password": "{password}"}}' '
+        f'"https://wazuh.dashboard:5601/auth/login"'
+    )
+    cmd = ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", inner]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Clean up cookie file
+    subprocess.run(
+        ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", f"rm -f /tmp/kibana_cookie_{username}"],
+        capture_output=True
+    )
+    if '"username"' in result.stdout or 'redirected' in result.stdout.lower():
+        ok("Login successful — kibana space initialized")
+        return True
+    else:
+        log(f"Login response: {result.stdout[:200]}")
+        return False
+
+
+def add_user(tenant, username):
     sep()
     print(f" Adding user '{username}' to tenant '{tenant}'")
     sep()
@@ -454,7 +497,10 @@ def add_user(tenant, username, password):
     if rname not in result:
         err(f"Tenant '{tenant}' does not exist. Create it first with create-tenant.")
 
-    # 2. Create or update OpenSearch user
+    # 2. Generate password
+    password = generate_password()
+
+    # 3. Create OpenSearch user
     log(f"Creating OpenSearch user '{username}' ...")
     user = {
         "password": password,
@@ -468,7 +514,7 @@ def add_user(tenant, username, password):
     else:
         log(f"Note: {result}")
 
-    # 3. Map user to tenant role (append, don't overwrite)
+    # 4. Map user to tenant role (append, don't overwrite)
     log(f"Mapping '{username}' to role '{rname}' ...")
     existing = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
     current_users = existing.get(rname, {}).get("users", [])
@@ -481,14 +527,26 @@ def add_user(tenant, username, password):
     else:
         log(f"Note: {result}")
 
-    # 4. Update kibana index pattern if kibana space already exists
+    # 5. Trigger login to initialize kibana space
+    import time
+    trigger_kibana_login(username, password, tenant)
+    log("Waiting for kibana space to initialize ...")
+    time.sleep(5)
+
+    # 6. Update kibana index pattern
     log(f"Updating kibana index pattern for '{username}' ...")
     update_kibana_alerts_pattern(username, tenant)
 
     sep()
     print(f" User '{username}' added to tenant '{tenant}'.")
-    print(f" Note: if kibana space doesn't exist yet, have the user log in first,")
-    print(f" then run: sudo python3 tenant.py sync-role {tenant}")
+    print()
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  CREDENTIALS — print once, store safely  │")
+    print(f"  │  Username : {username:<29} │")
+    print(f"  │  Password : {password:<29} │")
+    print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
+    print(f"  └─────────────────────────────────────────┘")
+    print()
     sep()
     print()
 
@@ -620,8 +678,8 @@ if __name__ == "__main__":
         create_tenant(sys.argv[2])
 
     elif command == "add-user":
-        if len(sys.argv) != 5: usage()
-        add_user(sys.argv[2], sys.argv[3], sys.argv[4])
+        if len(sys.argv) != 4: usage()
+        add_user(sys.argv[2], sys.argv[3])
 
     elif command == "remove-user":
         if len(sys.argv) != 4: usage()
@@ -644,3 +702,4 @@ if __name__ == "__main__":
 
     else:
         usage()
+
