@@ -13,6 +13,8 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
   sudo python3 tenant.py list-tenants
   sudo python3 tenant.py list-users <tenant_name>
   sudo python3 tenant.py sync-role <tenant_name>
+  sudo python3 tenant.py enroll-agent <tenant_name> <agent_name>
+  sudo python3 tenant.py delete-agent <tenant_name> <agent_name>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  NEW TENANT LIFECYCLE
@@ -20,27 +22,36 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
  1. Create the tenant:
       sudo python3 tenant.py create-tenant <tenant_name>
     Creates:
-      - Wazuh agent group '<tenant_name>'
-      - agent.conf with label: group=<tenant_name>
+      - Wazuh agent group 'tenant_<tenant_name>'
+      - agent.conf with label: group=tenant_<tenant_name>
       - OpenSearch role 'tenant_<tenant_name>_role'
       - Wazuh API policy, role and rule scoped to the group
 
  2. Add a dashboard user:
       sudo python3 tenant.py add-user <tenant_name> <username>
-    Creates the OpenSearch user and maps them to the tenant role.
+    Creates the OpenSearch user with a generated password and maps
+    them to the tenant role. Password is printed once — store safely.
+    After the user logs in for the first time, run sync-role.
 
- 3. Enroll agents into the tenant group:
-    In the Wazuh dashboard (as admin), assign agents to the '<tenant_name>' group.
-    The agents will automatically receive the group label from agent.conf.
+ 3. Pre-register an agent for the tenant:
+      sudo python3 tenant.py enroll-agent <tenant_name> <agent_name>
+    Generates a one-time OS-aware install script served at:
+      https://<tenant_name>.zeroed.nl/register/<agent_name>
+    Tenant runs: curl -s https://<tenant>.zeroed.nl/register/<agent_name> | bash
+    Script deletes itself after use.
+    After the agent connects, run sync-role to update the DLS.
 
- 4. Sync the role after agents are enrolled:
+ 4. Delete a pre-registered agent (if not yet used):
+      sudo python3 tenant.py delete-agent <tenant_name> <agent_name>
+
+ 5. Sync the role after agents connect or users log in:
       sudo python3 tenant.py sync-role <tenant_name>
     Updates:
       - Inventory/vulnerability DLS with current agent IDs
       - Kibana alerts index pattern for all tenant users
     Run this again whenever agents are added or removed from the group.
 
- 5. Tenant users access the dashboard via:
+ 6. Tenant users access the dashboard via:
       https://<tenant_name>.zeroed.nl
     Caddy automatically injects the correct tenant header.
     DNS is handled by the wildcard *.zeroed.nl record.
@@ -48,7 +59,7 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  NOTES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- - Alert isolation: Filebeat routes alerts to wazuh-alerts-4.x-<tenant>-*
+ - Alert isolation: Filebeat routes alerts to wazuh-alerts-4.x-tenant_<name>-*
    Old alerts in wazuh-alerts-4.x-* are protected by agent.id DLS.
  - Inventory/IT Hygiene: isolated by agent.id DLS (Wazuh does not write
    group labels to inventory indices — see github.com/wazuh/wazuh/issues/33098)
@@ -57,6 +68,7 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
 """
 
 import sys
+import os
 import json
 import subprocess
 import base64
@@ -72,6 +84,10 @@ INDEXER_PASS      = "ais;aCahze9vi#"
 
 MANAGER_CONTAINER = "single-node-wazuh.manager-1"
 INDEXER_CONTAINER = "single-node-wazuh.indexer-1"
+
+WAZUH_VERSION     = "4.14.4"
+MANAGER_HOST      = "tuxido.zeroed.nl"
+REGISTER_DIR      = "/usr/local/ISGservices/register"
 
 # Role naming convention: tenant_{name}_role
 ROLE_PREFIX = "tenant_"
@@ -166,22 +182,16 @@ def inventory_dls(agent_ids):
 
 def get_kibana_tenant_index(tenant):
     """Find the kibana index for a given tenant name.
-    
     OpenSearch strips underscores from tenant names in kibana index names:
-    e.g. tenant_picard -> tenantpicard, so we need to try both the raw
-    tenant name and the full OpenSearch tenant name (tenant_{name}).
+    e.g. tenant_picard -> tenantpicard
     """
     result = indexer("GET", "/_cat/indices/.kibana_*?h=index&format=json")
     if not isinstance(result, list):
         return None
-
-    # Kibana strips underscores from tenant names in index names
-    # e.g. tenant_picard -> tenantpicard
     candidates = [
         group_name(tenant).replace("_", "").lower(),   # tenant_picard -> tenantpicard
         tenant.replace("_", "").lower(),               # picard -> picard (fallback)
     ]
-
     for item in result:
         idx = item.get("index", "").lower()
         for candidate in candidates:
@@ -197,7 +207,6 @@ def update_kibana_alerts_pattern(username, tenant):
         log(f"Could not find kibana index for tenant '{tenant}' — skipping index pattern update")
         log("A user must log in first to create the kibana space, then run sync-role")
         return False
-
     result = indexer("POST", f"/{kibana_index}/_update/index-pattern:wazuh-alerts-*", {
         "doc": {
             "index-pattern": {
@@ -232,8 +241,6 @@ def build_role(tenant, agent_ids):
         "cluster_permissions": ["cluster_composite_ops"],
         "index_permissions": [
             {
-                # Alerts: tenant-specific index — no DLS needed
-                # Filebeat dynamic routing puts alerts here using agent.labels.group
                 "index_patterns": [f"wazuh-alerts-4.x-{group_name(tenant)}-*"],
                 "dls": "",
                 "fls": [],
@@ -241,8 +248,6 @@ def build_role(tenant, agent_ids):
                 "allowed_actions": ["read", "indices:data/read/search"]
             },
             {
-                # Alerts: old/default index — DLS by agent.id as safety net
-                # Covers pre-routing alerts and raw Discover access
                 "index_patterns": ["wazuh-alerts-4.x-*"],
                 "dls": inventory_dls(agent_ids),
                 "fls": [],
@@ -250,7 +255,6 @@ def build_role(tenant, agent_ids):
                 "allowed_actions": ["read", "indices:data/read/search"]
             },
             {
-                # Monitoring: DLS by Wazuh group field
                 "index_patterns": ["wazuh-monitoring-*"],
                 "dls": json.dumps({"term": {"group.keyword": group_name(tenant)}}),
                 "fls": [],
@@ -258,8 +262,6 @@ def build_role(tenant, agent_ids):
                 "allowed_actions": ["read", "indices:data/read/search"]
             },
             {
-                # Inventory / IT Hygiene: DLS by agent.id
-                # Wazuh server does not write labels to inventory indices
                 "index_patterns": ["wazuh-states-inventory-*"],
                 "dls": inventory_dls(agent_ids),
                 "fls": [],
@@ -267,7 +269,6 @@ def build_role(tenant, agent_ids):
                 "allowed_actions": ["read", "indices:data/read/search"]
             },
             {
-                # Vulnerabilities: DLS by agent.id (same reason as inventory)
                 "index_patterns": ["wazuh-states-vulnerabilities-*"],
                 "dls": inventory_dls(agent_ids),
                 "fls": [],
@@ -275,7 +276,6 @@ def build_role(tenant, agent_ids):
                 "allowed_actions": ["read", "indices:data/read/search"]
             },
             {
-                # Statistics: shared, no DLS
                 "index_patterns": ["wazuh-statistics-*"],
                 "dls": "",
                 "fls": [],
@@ -303,7 +303,7 @@ def create_tenant(tenant):
     log(f"Creating Wazuh agent group '{group_name(tenant)}' ...")
     result = wazuh("POST", "/groups", {"group_id": group_name(tenant)})
     if result.get("data", {}).get("affected_items"):
-        ok(f"Agent group '{tenant}' created")
+        ok(f"Agent group '{group_name(tenant)}' created")
     else:
         log(f"Note: {result}")
 
@@ -323,8 +323,8 @@ def create_tenant(tenant):
     else:
         log(f"Note: {result}")
 
-    # 3. Look up agent IDs for this group (likely empty at creation time)
-    log(f"Looking up agents in group '{tenant}' ...")
+    # 3. Look up agent IDs (likely empty at creation time)
+    log(f"Looking up agents in group '{group_name(tenant)}' ...")
     agent_ids = get_agent_ids_for_group(tenant)
     if agent_ids:
         ok(f"Found agents: {agent_ids}")
@@ -344,7 +344,7 @@ def create_tenant(tenant):
     # 5. Create Wazuh API policy
     log(f"Creating Wazuh API policy for '{tenant}' ...")
     wazuh_policy = {
-        "name": f"pol_{tenant}",
+        "name": f"pol_{group_name(tenant)}",
         "policy": {
             "actions": [
                 "agent:read", "group:read", "ciscat:read", "sca:read",
@@ -368,7 +368,7 @@ def create_tenant(tenant):
 
     # 6. Create Wazuh API role
     log(f"Creating Wazuh API role for '{tenant}' ...")
-    result = wazuh("POST", "/security/roles", {"name": f"wazuh_{tenant}"})
+    result = wazuh("POST", "/security/roles", {"name": f"wazuh_{group_name(tenant)}"})
     wazuh_role_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
     if wazuh_role_id:
         ok(f"Wazuh API role created (id={wazuh_role_id})")
@@ -387,7 +387,7 @@ def create_tenant(tenant):
     # 8. Create Wazuh API rule
     log(f"Creating Wazuh API rule for '{tenant}' ...")
     wazuh_rule = {
-        "name": f"map_{tenant}",
+        "name": f"map_{group_name(tenant)}",
         "rule": {"FIND": {"user_name": f"__placeholder_{tenant}__"}}
     }
     result = wazuh("POST", "/security/rules", wazuh_rule)
@@ -408,8 +408,8 @@ def create_tenant(tenant):
 
     sep()
     print(f" Tenant '{tenant}' is ready.")
-    print(f" Add users with: sudo python3 tenant.py add-user {tenant} <username> <password>")
-    print(f" After adding agents, run: sudo python3 tenant.py sync-role {tenant}")
+    print(f" Add users with: sudo python3 tenant.py add-user {tenant} <username>")
+    print(f" Enroll agents with: sudo python3 tenant.py enroll-agent {tenant} <agent_name>")
     sep()
     print()
 
@@ -423,20 +423,17 @@ def sync_role(tenant):
 
     rname = role_name(tenant)
 
-    # Verify role exists
     result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
     if rname not in result:
         err(f"Tenant '{tenant}' does not exist.")
 
-    # Get current agent IDs
-    log(f"Looking up agents in group '{tenant}' ...")
+    log(f"Looking up agents in group '{group_name(tenant)}' ...")
     agent_ids = get_agent_ids_for_group(tenant)
     if agent_ids:
         ok(f"Found agents: {agent_ids}")
     else:
         log("No agents in group — inventory DLS will be set to match-none")
 
-    # Rebuild and update role
     log(f"Updating role '{rname}' ...")
     role = build_role(tenant, agent_ids)
     result = indexer("PUT", f"/_plugins/_security/api/roles/{rname}", role)
@@ -445,7 +442,6 @@ def sync_role(tenant):
     else:
         log(f"Note: {result}")
 
-    # Update kibana index pattern for the tenant space (shared by all users in the tenant)
     log(f"Updating kibana index pattern for tenant '{tenant}' ...")
     update_kibana_alerts_pattern(None, tenant)
 
@@ -477,15 +473,12 @@ def add_user(tenant, username):
 
     rname = role_name(tenant)
 
-    # 1. Verify tenant role exists
     result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
     if rname not in result:
         err(f"Tenant '{tenant}' does not exist. Create it first with create-tenant.")
 
-    # 2. Generate password
     password = generate_password()
 
-    # 3. Create OpenSearch user
     log(f"Creating OpenSearch user '{username}' ...")
     user = {
         "password": password,
@@ -499,7 +492,6 @@ def add_user(tenant, username):
     else:
         log(f"Note: {result}")
 
-    # 4. Map user to tenant role (append, don't overwrite)
     log(f"Mapping '{username}' to role '{rname}' ...")
     existing = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
     current_users = existing.get(rname, {}).get("users", [])
@@ -512,6 +504,9 @@ def add_user(tenant, username):
     else:
         log(f"Note: {result}")
 
+    log(f"Updating kibana index pattern for tenant '{tenant}' ...")
+    update_kibana_alerts_pattern(None, tenant)
+
     sep()
     print(f" User '{username}' added to tenant '{tenant}'.")
     print()
@@ -519,13 +514,14 @@ def add_user(tenant, username):
     print(f"  │  CREDENTIALS — print once, store safely  │")
     print(f"  │  Username : {username:<29} │")
     print(f"  │  Password : {password:<29} │")
-    print(f"  │  URL      : https://{tenant}.zeroed.nl{chr(32) * max(0, 17 - len(tenant))}│")
+    print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
     print(f"  └─────────────────────────────────────────┘")
     print()
     print(f"  After the user logs in for the first time, run:")
     print(f"  sudo python3 tenant.py sync-role {tenant}")
     sep()
     print()
+
 
 # ── remove-user ───────────────────────────────────────────────
 def remove_user(tenant, username):
@@ -637,6 +633,168 @@ def list_users(tenant):
     print()
 
 
+# ── enroll-agent ──────────────────────────────────────────────
+def generate_register_script(tenant, agent_name, agent_key):
+    """Generate a self-contained OS-aware install script."""
+    v = WAZUH_VERSION
+    m = MANAGER_HOST
+
+    script = f"""#!/bin/sh
+# Wazuh agent install script for {agent_name} (tenant: {tenant})
+# One-time use — generated by tenant.py enroll-agent
+set -e
+
+MANAGER="{m}"
+AGENT_NAME="{agent_name}"
+AGENT_KEY="{agent_key}"
+VERSION="{v}"
+
+echo "Detecting OS..."
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+if [ "$OS" = "Linux" ]; then
+    if [ -f /etc/debian_version ]; then
+        echo "Detected: Debian/Ubuntu"
+        curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring \\
+            --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import
+        chmod 644 /usr/share/keyrings/wazuh.gpg
+        echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" \\
+            | tee /etc/apt/sources.list.d/wazuh.list
+        apt-get update -q
+        WAZUH_MANAGER="$MANAGER" WAZUH_AGENT_NAME="$AGENT_NAME" apt-get install -y wazuh-agent=$VERSION-1
+    elif [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+        echo "Detected: RPM-based Linux"
+        rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+        cat > /etc/yum.repos.d/wazuh.repo << 'REPO'
+[wazuh]
+gpgcheck=1
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+enabled=1
+name=Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
+REPO
+        WAZUH_MANAGER="$MANAGER" WAZUH_AGENT_NAME="$AGENT_NAME" yum install -y wazuh-agent-$VERSION-1
+    else
+        echo "Unsupported Linux distribution"
+        exit 1
+    fi
+    /var/ossec/bin/agent-auth -k "$AGENT_KEY" -A "$AGENT_NAME" -m "$MANAGER"
+    systemctl enable --now wazuh-agent
+
+elif [ "$OS" = "Darwin" ]; then
+    if [ "$ARCH" = "arm64" ]; then
+        PKG="wazuh-agent-$VERSION-1.arm64.pkg"
+    else
+        PKG="wazuh-agent-$VERSION-1.intel64.pkg"
+    fi
+    echo "Detected: macOS ($ARCH)"
+    curl -o /tmp/wazuh-agent.pkg "https://packages.wazuh.com/4.x/macos/$PKG"
+    echo "WAZUH_MANAGER='$MANAGER'" > /tmp/wazuh_envs
+    sudo installer -pkg /tmp/wazuh-agent.pkg -target /
+    rm -f /tmp/wazuh-agent.pkg /tmp/wazuh_envs
+    /Library/Ossec/bin/agent-auth -k "$AGENT_KEY" -A "$AGENT_NAME" -m "$MANAGER"
+    /Library/Ossec/bin/wazuh-control start
+
+else
+    echo "Unsupported OS: $OS"
+    echo "For Windows, contact your administrator."
+    exit 1
+fi
+
+echo ""
+echo "Agent '$AGENT_NAME' successfully enrolled!"
+echo "Please notify your administrator to run: sudo python3 tenant.py sync-role {tenant}"
+"""
+    return script
+
+
+def enroll_agent(tenant, agent_name):
+    sep()
+    print(f" Enrolling agent '{agent_name}' for tenant '{tenant}'")
+    sep()
+
+    # 1. Pre-register agent via Wazuh API
+    log(f"Registering agent '{agent_name}' ...")
+    result = wazuh("POST", "/agents", {"name": agent_name})
+
+    if result.get("error") != 0:
+        err(f"Failed to register agent: {result}")
+
+    agent_id  = result["data"]["id"]
+    agent_key = result["data"]["key"]
+    ok(f"Agent registered: id={agent_id}")
+
+    # 2. Assign agent to tenant group
+    log(f"Assigning agent to group '{group_name(tenant)}' ...")
+    result = wazuh("PUT", f"/agents/{agent_id}/group/{group_name(tenant)}")
+    if result.get("error") == 0:
+        ok(f"Agent assigned to group '{group_name(tenant)}'")
+    else:
+        log(f"Note: {result}")
+
+    # 3. Generate install script
+    log("Generating install script ...")
+    script = generate_register_script(tenant, agent_name, agent_key)
+
+    # 4. Save to register directory
+    script_dir = os.path.join(REGISTER_DIR, tenant)
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, agent_name)
+    with open(script_path, 'w') as f:
+        f.write(script)
+    os.chmod(script_path, 0o644)
+    ok(f"Script saved to {script_path}")
+
+    sep()
+    print(f" Agent '{agent_name}' ready for tenant '{tenant}'.")
+    print()
+    print(f"  Send this ONE command to the tenant:")
+    print()
+    print(f"  curl -s https://{tenant}.zeroed.nl/register/{agent_name} | bash")
+    print()
+    print(f"  The script is OS-aware (Linux Debian/RPM, macOS Intel/Apple Silicon).")
+    print(f"  After the agent connects, run:")
+    print(f"  sudo python3 tenant.py sync-role {tenant}")
+    sep()
+    print()
+
+
+# ── delete-agent ──────────────────────────────────────────────
+def delete_agent(tenant, agent_name):
+    sep()
+    print(f" Deleting pre-registered agent '{agent_name}' for tenant '{tenant}'")
+    sep()
+
+    # Remove script file
+    script_path = os.path.join(REGISTER_DIR, tenant, agent_name)
+    if os.path.exists(script_path):
+        os.remove(script_path)
+        ok(f"Script deleted: {script_path}")
+    else:
+        log(f"No script found at {script_path}")
+
+    # Remove from Wazuh if never connected
+    log(f"Looking up agent '{agent_name}' in Wazuh ...")
+    result = wazuh("GET", f"/agents?name={agent_name}&status=never_connected")
+    agents = result.get("data", {}).get("affected_items", [])
+    if agents:
+        aid = agents[0]["id"]
+        result = wazuh("DELETE", f"/agents?agents_list={aid}&older_than=0s&status=never_connected")
+        if result.get("error") == 0:
+            ok(f"Agent {aid} deleted from Wazuh")
+        else:
+            log(f"Note: {result}")
+    else:
+        log("Agent not found in Wazuh (may already be connected or deleted)")
+
+    sep()
+    print(f" Done.")
+    sep()
+    print()
+
+
 # ── Main ──────────────────────────────────────────────────────
 def usage():
     print(__doc__)
@@ -676,6 +834,13 @@ if __name__ == "__main__":
         if len(sys.argv) != 3: usage()
         sync_role(sys.argv[2])
 
+    elif command == "enroll-agent":
+        if len(sys.argv) != 4: usage()
+        enroll_agent(sys.argv[2], sys.argv[3])
+
+    elif command == "delete-agent":
+        if len(sys.argv) != 4: usage()
+        delete_agent(sys.argv[2], sys.argv[3])
+
     else:
         usage()
-

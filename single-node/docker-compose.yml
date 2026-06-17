@@ -253,6 +253,12 @@ services:
         read_only: true
         bind:
           create_host_path: true
+      - type: bind
+        source: /usr/local/ISGservices/register
+        target: /register
+        read_only: true
+        bind:
+          create_host_path: true
       - type: volume
         source: caddy_data
         target: /data

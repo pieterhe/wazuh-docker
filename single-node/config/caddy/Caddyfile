@@ -30,6 +30,13 @@ tuxido.zeroed.nl {
 *.zeroed.nl {
 	import zeroed_nl_tls
 
+	# Serve one-time agent install scripts
+	handle /register/* {
+		root * /register/{labels.2}
+		uri strip_prefix /register
+		file_server
+	}
+
 	reverse_proxy wazuh.dashboard:5601 {
 		transport http {
 			tls
