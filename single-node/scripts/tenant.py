@@ -461,13 +461,14 @@ def trigger_kibana_login(username, password, tenant):
     """Log in as the user to trigger kibana space creation."""
     import time
     log(f"Triggering login for '{username}' to initialize kibana space ...")
+    body = json.dumps({"username": username, "password": password}).replace("'", "'\''")
     inner = (
         f'curl -sk -X POST '
         f'-H "Content-Type: application/json" '
         f'-H "osd-xsrf: true" '
         f'-H "securitytenant: tenant_{tenant}" '
-        f'-c /tmp/kibana_cookie_{username} '
-        f'-d '{{"username": "{username}", "password": "{password}"}}' '
+        f"-c /tmp/kibana_cookie_{username} "
+        f"-d '{body}' "
         f'"https://wazuh.dashboard:5601/auth/login"'
     )
     cmd = ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", inner]
