@@ -137,6 +137,11 @@ def role_name(tenant):
     return f"{ROLE_PREFIX}{tenant}{ROLE_SUFFIX}"
 
 
+def group_name(tenant):
+    """The Wazuh group name is always tenant_<name>."""
+    return f"tenant_{tenant}"
+
+
 def tenant_from_role(role):
     if role.startswith(ROLE_PREFIX) and role.endswith(ROLE_SUFFIX):
         return role[len(ROLE_PREFIX):-len(ROLE_SUFFIX)]
@@ -145,7 +150,7 @@ def tenant_from_role(role):
 
 def get_agent_ids_for_group(tenant):
     """Get all agent IDs that belong to the tenant group."""
-    result = wazuh("GET", f"/agents?groups_list={tenant}&limit=500")
+    result = wazuh("GET", f"/agents?groups_list={group_name(tenant)}&limit=500")
     agents = result.get("data", {}).get("affected_items", [])
     return [a["id"] for a in agents]
 
@@ -159,23 +164,38 @@ def inventory_dls(agent_ids):
     return json.dumps({"terms": {"agent.id": agent_ids}})
 
 
-def get_kibana_index(username):
-    """Find the kibana index for a given username."""
+def get_kibana_tenant_index(tenant):
+    """Find the kibana index for a given tenant name.
+    
+    OpenSearch strips underscores from tenant names in kibana index names:
+    e.g. tenant_picard -> tenantpicard, so we need to try both the raw
+    tenant name and the full OpenSearch tenant name (tenant_{name}).
+    """
     result = indexer("GET", "/_cat/indices/.kibana_*?h=index&format=json")
-    if isinstance(result, list):
-        for item in result:
-            idx = item.get("index", "")
-            if f"_{username.lower()}_" in idx.lower():
-                return idx
+    if not isinstance(result, list):
+        return None
+
+    # Kibana strips underscores from tenant names in index names
+    # e.g. tenant_picard -> tenantpicard
+    candidates = [
+        group_name(tenant).replace("_", "").lower(),   # tenant_picard -> tenantpicard
+        tenant.replace("_", "").lower(),               # picard -> picard (fallback)
+    ]
+
+    for item in result:
+        idx = item.get("index", "").lower()
+        for candidate in candidates:
+            if f"_{candidate}_" in idx:
+                return item.get("index")
     return None
 
 
 def update_kibana_alerts_pattern(username, tenant):
-    """Update the wazuh-alerts-* index pattern in the user's kibana space."""
-    kibana_index = get_kibana_index(username)
+    """Update the wazuh-alerts-* index pattern in the tenant's kibana space."""
+    kibana_index = get_kibana_tenant_index(tenant)
     if not kibana_index:
-        log(f"Could not find kibana index for user '{username}' — skipping index pattern update")
-        log("User must log in first to create their kibana space, then run sync-role")
+        log(f"Could not find kibana index for tenant '{tenant}' — skipping index pattern update")
+        log("A user must log in first to create the kibana space, then run sync-role")
         return False
 
     result = indexer("POST", f"/{kibana_index}/_update/index-pattern:wazuh-alerts-*", {
@@ -213,8 +233,8 @@ def build_role(tenant, agent_ids):
         "index_permissions": [
             {
                 # Alerts: tenant-specific index — no DLS needed
-                # Filebeat dynamic routing puts alerts here
-                "index_patterns": [f"wazuh-alerts-4.x-{tenant}-*"],
+                # Filebeat dynamic routing puts alerts here using agent.labels.group
+                "index_patterns": [f"wazuh-alerts-4.x-{group_name(tenant)}-*"],
                 "dls": "",
                 "fls": [],
                 "masked_fields": [],
@@ -232,7 +252,7 @@ def build_role(tenant, agent_ids):
             {
                 # Monitoring: DLS by Wazuh group field
                 "index_patterns": ["wazuh-monitoring-*"],
-                "dls": json.dumps({"term": {"group.keyword": tenant}}),
+                "dls": json.dumps({"term": {"group.keyword": group_name(tenant)}}),
                 "fls": [],
                 "masked_fields": [],
                 "allowed_actions": ["read", "indices:data/read/search"]
@@ -265,7 +285,7 @@ def build_role(tenant, agent_ids):
         ],
         "tenant_permissions": [
             {
-                "tenant_patterns": [tenant],
+                "tenant_patterns": [group_name(tenant)],
                 "allowed_actions": ["kibana_all_write"]
             }
         ]
@@ -280,24 +300,24 @@ def create_tenant(tenant):
     sep()
 
     # 1. Create Wazuh agent group
-    log(f"Creating Wazuh agent group '{tenant}' ...")
-    result = wazuh("POST", "/groups", {"group_id": tenant})
+    log(f"Creating Wazuh agent group '{group_name(tenant)}' ...")
+    result = wazuh("POST", "/groups", {"group_id": group_name(tenant)})
     if result.get("data", {}).get("affected_items"):
         ok(f"Agent group '{tenant}' created")
     else:
         log(f"Note: {result}")
 
     # 2. Upload agent.conf with label
-    log(f"Uploading agent.conf with label group={tenant} ...")
+    log(f"Uploading agent.conf with label group={group_name(tenant)} ...")
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<agent_config>\n'
         '  <labels>\n'
-        f'    <label key="group">{tenant}</label>\n'
+        f'    <label key="group">{group_name(tenant)}</label>\n'
         '  </labels>\n'
         '</agent_config>'
     )
-    result = wazuh("PUT", f"/groups/{tenant}/configuration", body=xml, content_type="application/xml")
+    result = wazuh("PUT", f"/groups/{group_name(tenant)}/configuration", body=xml, content_type="application/xml")
     if "successfully" in str(result):
         ok("agent.conf uploaded")
     else:
@@ -333,8 +353,8 @@ def create_tenant(tenant):
                 "cluster:status", "manager:read"
             ],
             "resources": [
-                f"agent:group:{tenant}",
-                f"group:id:{tenant}"
+                f"agent:group:{group_name(tenant)}",
+                f"group:id:{group_name(tenant)}"
             ],
             "effect": "allow"
         }
@@ -425,15 +445,9 @@ def sync_role(tenant):
     else:
         log(f"Note: {result}")
 
-    # Update kibana index patterns for all mapped users
-    mapping = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
-    users = mapping.get(rname, {}).get("users", [])
-    if users:
-        log(f"Updating kibana index patterns for users: {users} ...")
-        for username in users:
-            update_kibana_alerts_pattern(username, tenant)
-    else:
-        log("No users mapped to this role yet")
+    # Update kibana index pattern for the tenant space (shared by all users in the tenant)
+    log(f"Updating kibana index pattern for tenant '{tenant}' ...")
+    update_kibana_alerts_pattern(None, tenant)
 
     sep()
     print(f" Sync complete.")
@@ -505,7 +519,7 @@ def add_user(tenant, username):
     print(f"  │  CREDENTIALS — print once, store safely  │")
     print(f"  │  Username : {username:<29} │")
     print(f"  │  Password : {password:<29} │")
-    print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
+    print(f"  │  URL      : https://{tenant}.zeroed.nl{chr(32) * max(0, 17 - len(tenant))}│")
     print(f"  └─────────────────────────────────────────┘")
     print()
     print(f"  After the user logs in for the first time, run:")
@@ -569,8 +583,8 @@ def delete_tenant(tenant):
     indexer("DELETE", f"/_plugins/_security/api/roles/{rname}")
     ok("Role deleted")
 
-    log(f"Deleting Wazuh agent group '{tenant}' ...")
-    wazuh("DELETE", "/groups", {"groups_list": [tenant]})
+    log(f"Deleting Wazuh agent group '{group_name(tenant)}' ...")
+    wazuh("DELETE", "/groups", {"groups_list": [group_name(tenant)]})
     ok("Agent group deleted")
 
     sep()
@@ -664,3 +678,4 @@ if __name__ == "__main__":
 
     else:
         usage()
+
