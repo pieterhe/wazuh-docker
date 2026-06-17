@@ -3,13 +3,57 @@
 tenant.py
 Manages Wazuh tenants: create tenant groups, roles, and users.
 
-Usage:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   sudo python3 tenant.py create-tenant <tenant_name>
   sudo python3 tenant.py add-user <tenant_name> <username> <password>
   sudo python3 tenant.py remove-user <tenant_name> <username>
   sudo python3 tenant.py delete-tenant <tenant_name>
   sudo python3 tenant.py list-tenants
   sudo python3 tenant.py list-users <tenant_name>
+  sudo python3 tenant.py sync-role <tenant_name>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ NEW TENANT LIFECYCLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. Create the tenant:
+      sudo python3 tenant.py create-tenant <tenant_name>
+    Creates:
+      - Wazuh agent group '<tenant_name>'
+      - agent.conf with label: group=<tenant_name>
+      - OpenSearch role 'tenant_<tenant_name>_role'
+      - Wazuh API policy, role and rule scoped to the group
+
+ 2. Add a dashboard user:
+      sudo python3 tenant.py add-user <tenant_name> <username> <password>
+    Creates the OpenSearch user and maps them to the tenant role.
+
+ 3. Enroll agents into the tenant group:
+    In the Wazuh dashboard (as admin), assign agents to the '<tenant_name>' group.
+    The agents will automatically receive the group label from agent.conf.
+
+ 4. Sync the role after agents are enrolled:
+      sudo python3 tenant.py sync-role <tenant_name>
+    Updates:
+      - Inventory/vulnerability DLS with current agent IDs
+      - Kibana alerts index pattern for all tenant users
+    Run this again whenever agents are added or removed from the group.
+
+ 5. Tenant users access the dashboard via:
+      https://<tenant_name>.zeroed.nl
+    Caddy automatically injects the correct tenant header.
+    DNS is handled by the wildcard *.zeroed.nl record.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ - Alert isolation: Filebeat routes alerts to wazuh-alerts-4.x-<tenant>-*
+   Old alerts in wazuh-alerts-4.x-* are protected by agent.id DLS.
+ - Inventory/IT Hygiene: isolated by agent.id DLS (Wazuh does not write
+   group labels to inventory indices — see github.com/wazuh/wazuh/issues/33098)
+ - Monitoring: isolated by group.keyword DLS
+ - Run sync-role after any agent group membership change.
 """
 
 import sys
@@ -97,6 +141,56 @@ def tenant_from_role(role):
     if role.startswith(ROLE_PREFIX) and role.endswith(ROLE_SUFFIX):
         return role[len(ROLE_PREFIX):-len(ROLE_SUFFIX)]
     return None
+
+
+def get_agent_ids_for_group(tenant):
+    """Get all agent IDs that belong to the tenant group."""
+    result = wazuh("GET", f"/agents?groups_list={tenant}&limit=500")
+    agents = result.get("data", {}).get("affected_items", [])
+    return [a["id"] for a in agents]
+
+
+def inventory_dls(agent_ids):
+    """Build DLS query for inventory indices based on agent IDs."""
+    if not agent_ids:
+        return json.dumps({"match_none": {}})
+    if len(agent_ids) == 1:
+        return json.dumps({"term": {"agent.id": agent_ids[0]}})
+    return json.dumps({"terms": {"agent.id": agent_ids}})
+
+
+def get_kibana_index(username):
+    """Find the kibana index for a given username."""
+    result = indexer("GET", "/_cat/indices/.kibana_*?h=index&format=json")
+    if isinstance(result, list):
+        for item in result:
+            idx = item.get("index", "")
+            if f"_{username.lower()}_" in idx.lower():
+                return idx
+    return None
+
+
+def update_kibana_alerts_pattern(username, tenant):
+    """Update the wazuh-alerts-* index pattern in the user's kibana space."""
+    kibana_index = get_kibana_index(username)
+    if not kibana_index:
+        log(f"Could not find kibana index for user '{username}' — skipping index pattern update")
+        log("User must log in first to create their kibana space, then run sync-role")
+        return False
+
+    result = indexer("POST", f"/{kibana_index}/_update/index-pattern:wazuh-alerts-*", {
+        "doc": {
+            "index-pattern": {
+                "title": f"wazuh-alerts-4.x-{tenant}-*"
+            }
+        }
+    })
+    if result.get("result") in ("updated", "noop"):
+        ok(f"Kibana alerts index pattern updated to 'wazuh-alerts-4.x-{tenant}-*'")
+        return True
+    else:
+        log(f"Note: {result}")
+        return False
 # ─────────────────────────────────────────────────────────────
 
 
@@ -107,6 +201,75 @@ def sep():    print(f"\n{SEP}")
 def ok(msg):  print(f"  [OK]  {msg}")
 def log(msg): print(f"        {msg}")
 def err(msg): print(f"  [ERR] {msg}"); sys.exit(1)
+# ─────────────────────────────────────────────────────────────
+
+
+# ── build_role ────────────────────────────────────────────────
+def build_role(tenant, agent_ids):
+    """Build the OpenSearch role definition for a tenant."""
+    return {
+        "description": f"Role for tenant {tenant}",
+        "cluster_permissions": ["cluster_composite_ops"],
+        "index_permissions": [
+            {
+                # Alerts: tenant-specific index — no DLS needed
+                # Filebeat dynamic routing puts alerts here
+                "index_patterns": [f"wazuh-alerts-4.x-{tenant}-*"],
+                "dls": "",
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                # Alerts: old/default index — DLS by agent.id as safety net
+                # Covers pre-routing alerts and raw Discover access
+                "index_patterns": ["wazuh-alerts-4.x-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                # Monitoring: DLS by Wazuh group field
+                "index_patterns": ["wazuh-monitoring-*"],
+                "dls": json.dumps({"term": {"group.keyword": tenant}}),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                # Inventory / IT Hygiene: DLS by agent.id
+                # Wazuh server does not write labels to inventory indices
+                "index_patterns": ["wazuh-states-inventory-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                # Vulnerabilities: DLS by agent.id (same reason as inventory)
+                "index_patterns": ["wazuh-states-vulnerabilities-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                # Statistics: shared, no DLS
+                "index_patterns": ["wazuh-statistics-*"],
+                "dls": "",
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            }
+        ],
+        "tenant_permissions": [
+            {
+                "tenant_patterns": [tenant],
+                "allowed_actions": ["kibana_all_write"]
+            }
+        ]
+    }
 # ─────────────────────────────────────────────────────────────
 
 
@@ -140,62 +303,140 @@ def create_tenant(tenant):
     else:
         log(f"Note: {result}")
 
-    # 3. Create OpenSearch role
+    # 3. Look up agent IDs for this group (likely empty at creation time)
+    log(f"Looking up agents in group '{tenant}' ...")
+    agent_ids = get_agent_ids_for_group(tenant)
+    if agent_ids:
+        ok(f"Found agents: {agent_ids}")
+    else:
+        log("No agents yet — inventory DLS will be set to match-none until agents are added")
+
+    # 4. Create OpenSearch role
     rname = role_name(tenant)
     log(f"Creating OpenSearch role '{rname}' ...")
-    role = {
-        "description": f"Role for tenant {tenant}",
-        "cluster_permissions": ["cluster_composite_ops"],
-        "index_permissions": [
-            {
-                # Alerts: restrict by index pattern (no DLS needed)
-                "index_patterns": [f"wazuh-alerts-4.x-{tenant}-*"],
-                "dls": "",
-                "fls": [],
-                "masked_fields": [],
-                "allowed_actions": ["read", "indices:data/read/search"]
-            },
-            {
-                # Monitoring: DLS by group field
-                "index_patterns": ["wazuh-monitoring-*"],
-                "dls": json.dumps({"term": {"group.keyword": tenant}}),
-                "fls": [],
-                "masked_fields": [],
-                "allowed_actions": ["read", "indices:data/read/search"]
-            },
-            {
-                # Inventory / IT Hygiene: DLS by agent label
-                "index_patterns": ["wazuh-states-inventory-*"],
-                "dls": json.dumps({"term": {"agent.labels.group": tenant}}),
-                "fls": [],
-                "masked_fields": [],
-                "allowed_actions": ["read", "indices:data/read/search"]
-            },
-            {
-                # Statistics: shared, no DLS
-                "index_patterns": ["wazuh-statistics-*"],
-                "dls": "",
-                "fls": [],
-                "masked_fields": [],
-                "allowed_actions": ["read", "indices:data/read/search"]
-            }
-        ],
-        "tenant_permissions": [
-            {
-                "tenant_patterns": [tenant],
-                "allowed_actions": ["kibana_all_write"]
-            }
-        ]
-    }
+    role = build_role(tenant, agent_ids)
     result = indexer("PUT", f"/_plugins/_security/api/roles/{rname}", role)
     if result.get("status") in ("CREATED", "OK"):
         ok(f"Role '{rname}' created")
     else:
         log(f"Note: {result}")
 
+    # 5. Create Wazuh API policy
+    log(f"Creating Wazuh API policy for '{tenant}' ...")
+    wazuh_policy = {
+        "name": f"pol_{tenant}",
+        "policy": {
+            "actions": [
+                "agent:read", "group:read", "ciscat:read", "sca:read",
+                "syscheck:read", "syscollector:read", "rootcheck:read",
+                "mitre:read", "rules:read", "decoders:read", "lists:read",
+                "cluster:status", "manager:read"
+            ],
+            "resources": [
+                f"agent:group:{tenant}",
+                f"group:id:{tenant}"
+            ],
+            "effect": "allow"
+        }
+    }
+    result = wazuh("POST", "/security/policies", wazuh_policy)
+    policy_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    if policy_id:
+        ok(f"Wazuh API policy created (id={policy_id})")
+    else:
+        log(f"Note: {result}")
+
+    # 6. Create Wazuh API role
+    log(f"Creating Wazuh API role for '{tenant}' ...")
+    result = wazuh("POST", "/security/roles", {"name": f"wazuh_{tenant}"})
+    wazuh_role_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    if wazuh_role_id:
+        ok(f"Wazuh API role created (id={wazuh_role_id})")
+    else:
+        log(f"Note: {result}")
+
+    # 7. Link policy to role
+    if policy_id and wazuh_role_id:
+        log(f"Linking policy to Wazuh API role ...")
+        result = wazuh("POST", f"/security/roles/{wazuh_role_id}/policies?policy_ids={policy_id}")
+        if result.get("error") == 0:
+            ok("Policy linked to role")
+        else:
+            log(f"Note: {result}")
+
+    # 8. Create Wazuh API rule
+    log(f"Creating Wazuh API rule for '{tenant}' ...")
+    wazuh_rule = {
+        "name": f"map_{tenant}",
+        "rule": {"FIND": {"user_name": f"__placeholder_{tenant}__"}}
+    }
+    result = wazuh("POST", "/security/rules", wazuh_rule)
+    rule_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    if rule_id:
+        ok(f"Wazuh API rule created (id={rule_id}) — update it when adding users")
+    else:
+        log(f"Note: {result}")
+
+    # 9. Link rule to role
+    if rule_id and wazuh_role_id:
+        log(f"Linking rule to Wazuh API role ...")
+        result = wazuh("POST", f"/security/roles/{wazuh_role_id}/rules?rule_ids={rule_id}")
+        if result.get("error") == 0:
+            ok("Rule linked to role")
+        else:
+            log(f"Note: {result}")
+
     sep()
     print(f" Tenant '{tenant}' is ready.")
     print(f" Add users with: sudo python3 tenant.py add-user {tenant} <username> <password>")
+    print(f" After adding agents, run: sudo python3 tenant.py sync-role {tenant}")
+    sep()
+    print()
+
+
+# ── sync-role ─────────────────────────────────────────────────
+def sync_role(tenant):
+    """Update inventory DLS and kibana index patterns based on current group members."""
+    sep()
+    print(f" Syncing role for tenant: {tenant}")
+    sep()
+
+    rname = role_name(tenant)
+
+    # Verify role exists
+    result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
+    if rname not in result:
+        err(f"Tenant '{tenant}' does not exist.")
+
+    # Get current agent IDs
+    log(f"Looking up agents in group '{tenant}' ...")
+    agent_ids = get_agent_ids_for_group(tenant)
+    if agent_ids:
+        ok(f"Found agents: {agent_ids}")
+    else:
+        log("No agents in group — inventory DLS will be set to match-none")
+
+    # Rebuild and update role
+    log(f"Updating role '{rname}' ...")
+    role = build_role(tenant, agent_ids)
+    result = indexer("PUT", f"/_plugins/_security/api/roles/{rname}", role)
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"Role '{rname}' updated with agent IDs: {agent_ids}")
+    else:
+        log(f"Note: {result}")
+
+    # Update kibana index patterns for all mapped users
+    mapping = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
+    users = mapping.get(rname, {}).get("users", [])
+    if users:
+        log(f"Updating kibana index patterns for users: {users} ...")
+        for username in users:
+            update_kibana_alerts_pattern(username, tenant)
+    else:
+        log("No users mapped to this role yet")
+
+    sep()
+    print(f" Sync complete.")
     sep()
     print()
 
@@ -240,8 +481,14 @@ def add_user(tenant, username, password):
     else:
         log(f"Note: {result}")
 
+    # 4. Update kibana index pattern if kibana space already exists
+    log(f"Updating kibana index pattern for '{username}' ...")
+    update_kibana_alerts_pattern(username, tenant)
+
     sep()
     print(f" User '{username}' added to tenant '{tenant}'.")
+    print(f" Note: if kibana space doesn't exist yet, have the user log in first,")
+    print(f" then run: sudo python3 tenant.py sync-role {tenant}")
     sep()
     print()
 
@@ -330,8 +577,10 @@ def list_tenants():
             rname = role_name(t)
             mapping = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
             users = mapping.get(rname, {}).get("users", [])
+            agent_ids = get_agent_ids_for_group(t)
             user_str = ", ".join(users) if users else "no users"
-            print(f"  {t}  ({user_str})")
+            agent_str = ", ".join(agent_ids) if agent_ids else "no agents"
+            print(f"  {t}  (users: {user_str} | agents: {agent_str})")
     else:
         print("  No tenants found.")
     print()
@@ -389,6 +638,9 @@ if __name__ == "__main__":
         if len(sys.argv) != 3: usage()
         list_users(sys.argv[2])
 
+    elif command == "sync-role":
+        if len(sys.argv) != 3: usage()
+        sync_role(sys.argv[2])
+
     else:
         usage()
-
