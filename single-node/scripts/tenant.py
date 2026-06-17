@@ -447,7 +447,6 @@ def generate_password():
     import secrets
     import string
     alphabet = string.ascii_letters + string.digits + "!@#%^&*"
-    # Ensure at least one of each required type
     while True:
         pwd = ''.join(secrets.choice(alphabet) for _ in range(20))
         if (any(c.islower() for c in pwd) and
@@ -455,35 +454,6 @@ def generate_password():
             any(c.isdigit() for c in pwd) and
             any(c in "!@#%^&*" for c in pwd)):
             return pwd
-
-
-def trigger_kibana_login(username, password, tenant):
-    """Log in as the user to trigger kibana space creation."""
-    import time
-    log(f"Triggering login for '{username}' to initialize kibana space ...")
-    body = json.dumps({"username": username, "password": password}).replace("'", "'\''")
-    inner = (
-        f'curl -sk -X POST '
-        f'-H "Content-Type: application/json" '
-        f'-H "osd-xsrf: true" '
-        f'-H "securitytenant: tenant_{tenant}" '
-        f"-c /tmp/kibana_cookie_{username} "
-        f"-d '{body}' "
-        f'"https://wazuh.dashboard:5601/auth/login"'
-    )
-    cmd = ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", inner]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    # Clean up cookie file
-    subprocess.run(
-        ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", f"rm -f /tmp/kibana_cookie_{username}"],
-        capture_output=True
-    )
-    if '"username"' in result.stdout or 'redirected' in result.stdout.lower():
-        ok("Login successful — kibana space initialized")
-        return True
-    else:
-        log(f"Login response: {result.stdout[:200]}")
-        return False
 
 
 def add_user(tenant, username):
@@ -528,16 +498,6 @@ def add_user(tenant, username):
     else:
         log(f"Note: {result}")
 
-    # 5. Trigger login to initialize kibana space
-    import time
-    trigger_kibana_login(username, password, tenant)
-    log("Waiting for kibana space to initialize ...")
-    time.sleep(5)
-
-    # 6. Update kibana index pattern
-    log(f"Updating kibana index pattern for '{username}' ...")
-    update_kibana_alerts_pattern(username, tenant)
-
     sep()
     print(f" User '{username}' added to tenant '{tenant}'.")
     print()
@@ -548,9 +508,10 @@ def add_user(tenant, username):
     print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
     print(f"  └─────────────────────────────────────────┘")
     print()
+    print(f"  After the user logs in for the first time, run:")
+    print(f"  sudo python3 tenant.py sync-role {tenant}")
     sep()
     print()
-
 
 # ── remove-user ───────────────────────────────────────────────
 def remove_user(tenant, username):
@@ -703,4 +664,3 @@ if __name__ == "__main__":
 
     else:
         usage()
-
