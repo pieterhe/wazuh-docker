@@ -31,6 +31,17 @@ tuxido.zeroed.nl {
 	import zeroed_nl_tls
 
 	# Serve one-time agent install scripts
+	# PowerShell UA → .ps1 variant; everything else → shell script
+	@ps1ua {
+		path /register/*
+		header User-Agent *PowerShell*
+	}
+	handle @ps1ua {
+		root * /register/{labels.2}
+		uri strip_prefix /register
+		rewrite * {path}.ps1
+		file_server
+	}
 	handle /register/* {
 		root * /register/{labels.2}
 		uri strip_prefix /register
