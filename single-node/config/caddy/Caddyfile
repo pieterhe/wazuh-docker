@@ -1,9 +1,7 @@
-# ── TLS snippet reused across all sites ──────────────────────
 (zeroed_nl_tls) {
 	tls /certs/zeroed_nl/fullchain.pem /certs/zeroed_nl/privkey.pem
 }
 
-# ── No-tenant proxy snippet ───────────────────────────────────
 (wazuh_proxy) {
 	reverse_proxy wazuh.dashboard:5601 {
 		transport http {
@@ -14,27 +12,23 @@
 	}
 }
 
-# ── Admin access — no tenant override ────────────────────────
 admin.zeroed.nl {
 	import zeroed_nl_tls
 	import wazuh_proxy
 }
 
-# ── Direct host access — no tenant override ───────────────────
 tuxido.zeroed.nl {
 	import zeroed_nl_tls
 	import wazuh_proxy
 }
 
-# ── Tenant access — inject securitytenant header ──────────────
 *.zeroed.nl {
 	import zeroed_nl_tls
 
-	# Serve one-time agent install scripts
-	# PowerShell UA → .ps1 variant; everything else → shell script
+	# PowerShell UA → serve .ps1 file
 	@ps1ua {
 		path /register/*
-		header User-Agent *PowerShell*
+		header_regexp User-Agent PowerShell
 	}
 	handle @ps1ua {
 		root * /register/{labels.2}
@@ -42,6 +36,8 @@ tuxido.zeroed.nl {
 		rewrite * {path}.ps1
 		file_server
 	}
+
+	# All other clients → serve shell script
 	handle /register/* {
 		root * /register/{labels.2}
 		uri strip_prefix /register
