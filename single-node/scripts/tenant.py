@@ -680,14 +680,13 @@ if ($p.ExitCode -ne 0) {{ Fail "Installation failed (exit $($p.ExitCode))" }}
 Ok "Agent installed"
 Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
 
-Step "Importing agent key"
-$manageAgents = "C:\\Program Files (x86)\\ossec-agent\\manage_agents.exe"
-if (-not (Test-Path $manageAgents)) {{
-    $manageAgents = "C:\\Program Files\\ossec-agent\\manage_agents.exe"
-}}
-$import = Start-Process $manageAgents -ArgumentList "-i `"$AgentKey`"" -Wait -PassThru -RedirectStandardInput NUL
-if ($import.ExitCode -ne 0) {{ Fail "Key import failed" }}
-Ok "Key imported"
+Step "Writing client.keys"
+$KeyDecoded = [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String($AgentKey))
+$OssecDirs  = @("C:\\Program Files (x86)\\ossec-agent", "C:\\Program Files\\ossec-agent")
+$OssecDir   = $OssecDirs | Where-Object {{ Test-Path $_ }} | Select-Object -First 1
+if (-not $OssecDir) {{ Fail "ossec-agent directory not found" }}
+[System.IO.File]::WriteAllText("$OssecDir\\client.keys", ($KeyDecoded + "`n"), [System.Text.Encoding]::ASCII)
+Ok "client.keys written"
 
 Step "Starting Wazuh agent service"
 try {{
