@@ -9,12 +9,12 @@ services:
         restart: true
         required: true
     environment:
-      API_PASSWORD: fea7Chahd[eeviquie
-      API_USERNAME: wazuh-wui
-      DASHBOARD_PASSWORD: ais;aCahze9vi#
-      DASHBOARD_USERNAME: kibanaserver
-      INDEXER_PASSWORD: ais;aCahze9vi#
-      INDEXER_USERNAME: admin
+      API_PASSWORD: ${WAZUH_API_PASS}
+      API_USERNAME: ${WAZUH_API_USER}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASS}
+      DASHBOARD_USERNAME: ${DASHBOARD_USER}
+      INDEXER_PASSWORD: ${INDEXER_PASS}
+      INDEXER_USERNAME: ${INDEXER_USER}
       WAZUH_API_URL: https://wazuh.manager
     hostname: wazuh.dashboard
     image: wazuh/wazuh-dashboard:4.14.4
@@ -126,12 +126,12 @@ services:
       context: /usr/local/ISGservices/wazuh-docker/single-node/wazuh-manager
       dockerfile: Dockerfile
     environment:
-      API_PASSWORD: fea7Chahd[eeviquie
-      API_USERNAME: wazuh-wui
+      API_PASSWORD: ${WAZUH_API_PASS}
+      API_USERNAME: ${WAZUH_API_USER}
       FILEBEAT_SSL_VERIFICATION_MODE: full
-      INDEXER_PASSWORD: ais;aCahze9vi#
+      INDEXER_PASSWORD: ${INDEXER_PASS}
       INDEXER_URL: '"https://wazuh.indexer:9200"'
-      INDEXER_USERNAME: admin
+      INDEXER_USERNAME: ${INDEXER_USER}
       SSL_CERTIFICATE: /etc/ssl/filebeat.pem
       SSL_CERTIFICATE_AUTHORITIES: /etc/ssl/root-ca.pem
       SSL_KEY: /etc/ssl/filebeat.key

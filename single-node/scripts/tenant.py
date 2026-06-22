@@ -73,14 +73,35 @@ import json
 import subprocess
 import base64
 
+
+def _load_dotenv():
+    env_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+
+def _require_env(key):
+    val = os.environ.get(key)
+    if not val:
+        sys.exit(f"Error: {key} not set — add it to single-node/.env")
+    return val
+
+
+_load_dotenv()
+
 # ── Configuration ─────────────────────────────────────────────
 WAZUH_API_URL     = "https://localhost:55000"
-WAZUH_API_USER    = "wazuh-wui"
-WAZUH_API_PASS    = "fea7Chahd[eeviquie"
+WAZUH_API_USER    = os.environ.get("WAZUH_API_USER", "wazuh-wui")
+WAZUH_API_PASS    = _require_env("WAZUH_API_PASS")
 
 INDEXER_URL       = "https://localhost:9200"
-INDEXER_USER      = "admin"
-INDEXER_PASS      = "ais;aCahze9vi#"
+INDEXER_USER      = os.environ.get("INDEXER_USER", "admin")
+INDEXER_PASS      = _require_env("INDEXER_PASS")
 
 MANAGER_CONTAINER = "single-node-wazuh.manager-1"
 INDEXER_CONTAINER = "single-node-wazuh.indexer-1"
