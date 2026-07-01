@@ -1,4 +1,4 @@
-FROM wazuh/wazuh-manager:4.14.4
+FROM wazuh/wazuh-manager:4.14.5
 
 # Copy patch scripts into the image
 COPY patch_templates.py /tmp/patch_templates.py
