@@ -106,7 +106,7 @@ INDEXER_PASS      = _require_env("INDEXER_PASS")
 MANAGER_CONTAINER = "single-node-wazuh.manager-1"
 INDEXER_CONTAINER = "single-node-wazuh.indexer-1"
 
-WAZUH_VERSION     = "4.14.4"
+WAZUH_VERSION     = "4.14.5"
 MANAGER_HOST      = "tuxido.zeroed.nl"
 REGISTER_DIR      = "/usr/local/ISGservices/register"
 
