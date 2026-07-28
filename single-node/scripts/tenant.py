@@ -380,20 +380,37 @@ def create_tenant(tenant):
         }
     }
     result = wazuh("POST", "/security/policies", wazuh_policy)
-    policy_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    items = result.get("data", {}).get("affected_items", [])
+    policy_id = items[0].get("id") if items else None
     if policy_id:
         ok(f"Wazuh API policy created (id={policy_id})")
     else:
-        log(f"Note: {result}")
+        # Fall back to looking up an existing policy with this name
+        all_policies = wazuh("GET", "/security/policies?limit=500")
+        for p in all_policies.get("data", {}).get("affected_items", []):
+            if p.get("name") == f"pol_{group_name(tenant)}":
+                policy_id = p["id"]
+                ok(f"Wazuh API policy already exists (id={policy_id})")
+                break
+        if not policy_id:
+            log(f"Note: {result}")
 
     # 6. Create Wazuh API role
     log(f"Creating Wazuh API role for '{tenant}' ...")
     result = wazuh("POST", "/security/roles", {"name": f"wazuh_{group_name(tenant)}"})
-    wazuh_role_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    items = result.get("data", {}).get("affected_items", [])
+    wazuh_role_id = items[0].get("id") if items else None
     if wazuh_role_id:
         ok(f"Wazuh API role created (id={wazuh_role_id})")
     else:
-        log(f"Note: {result}")
+        all_roles = wazuh("GET", "/security/roles?limit=500")
+        for r in all_roles.get("data", {}).get("affected_items", []):
+            if r.get("name") == f"wazuh_{group_name(tenant)}":
+                wazuh_role_id = r["id"]
+                ok(f"Wazuh API role already exists (id={wazuh_role_id})")
+                break
+        if not wazuh_role_id:
+            log(f"Note: {result}")
 
     # 7. Link policy to role
     if policy_id and wazuh_role_id:
@@ -411,11 +428,19 @@ def create_tenant(tenant):
         "rule": {"FIND": {"user_name": f"__placeholder_{tenant}__"}}
     }
     result = wazuh("POST", "/security/rules", wazuh_rule)
-    rule_id = result.get("data", {}).get("affected_items", [{}])[0].get("id")
+    items = result.get("data", {}).get("affected_items", [])
+    rule_id = items[0].get("id") if items else None
     if rule_id:
         ok(f"Wazuh API rule created (id={rule_id}) — update it when adding users")
     else:
-        log(f"Note: {result}")
+        all_rules = wazuh("GET", "/security/rules?limit=500")
+        for r in all_rules.get("data", {}).get("affected_items", []):
+            if r.get("name") == f"map_{group_name(tenant)}":
+                rule_id = r["id"]
+                ok(f"Wazuh API rule already exists (id={rule_id})")
+                break
+        if not rule_id:
+            log(f"Note: {result}")
 
     # 9. Link rule to role
     if rule_id and wazuh_role_id:
@@ -600,8 +625,41 @@ def delete_tenant(tenant):
     ok("Role deleted")
 
     log(f"Deleting Wazuh agent group '{group_name(tenant)}' ...")
-    wazuh("DELETE", "/groups", {"groups_list": [group_name(tenant)]})
-    ok("Agent group deleted")
+    result = wazuh("DELETE", "/groups", {"groups_list": [group_name(tenant)]})
+    if result.get("error") == 0:
+        ok("Agent group deleted")
+    else:
+        log(f"Note: {result}")
+
+    log(f"Deleting Wazuh API policy 'pol_{group_name(tenant)}' ...")
+    all_policies = wazuh("GET", "/security/policies?limit=500")
+    for p in all_policies.get("data", {}).get("affected_items", []):
+        if p.get("name") == f"pol_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/policies?policy_ids={p['id']}")
+            ok(f"Wazuh API policy deleted (id={p['id']})")
+            break
+    else:
+        log("Wazuh API policy not found, skipping")
+
+    log(f"Deleting Wazuh API role 'wazuh_{group_name(tenant)}' ...")
+    all_roles = wazuh("GET", "/security/roles?limit=500")
+    for r in all_roles.get("data", {}).get("affected_items", []):
+        if r.get("name") == f"wazuh_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/roles?role_ids={r['id']}")
+            ok(f"Wazuh API role deleted (id={r['id']})")
+            break
+    else:
+        log("Wazuh API role not found, skipping")
+
+    log(f"Deleting Wazuh API rule 'map_{group_name(tenant)}' ...")
+    all_rules = wazuh("GET", "/security/rules?limit=500")
+    for r in all_rules.get("data", {}).get("affected_items", []):
+        if r.get("name") == f"map_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/rules?rule_ids={r['id']}")
+            ok(f"Wazuh API rule deleted (id={r['id']})")
+            break
+    else:
+        log("Wazuh API rule not found, skipping")
 
     sep()
     print(f" Tenant '{tenant}' deleted.")
