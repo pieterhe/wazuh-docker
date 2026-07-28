@@ -625,7 +625,7 @@ def delete_tenant(tenant):
     ok("Role deleted")
 
     log(f"Deleting Wazuh agent group '{group_name(tenant)}' ...")
-    result = wazuh("DELETE", "/groups", {"groups_list": [group_name(tenant)]})
+    result = wazuh("DELETE", f"/groups?groups_list={group_name(tenant)}")
     if result.get("error") == 0:
         ok("Agent group deleted")
     else:
