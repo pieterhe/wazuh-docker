@@ -331,7 +331,6 @@ def create_tenant(tenant):
     # 2. Upload agent.conf with label
     log(f"Uploading agent.conf with label group={group_name(tenant)} ...")
     xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<agent_config>\n'
         '  <labels>\n'
         f'    <label key="group">{group_name(tenant)}</label>\n'
