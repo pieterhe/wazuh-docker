@@ -24,6 +24,7 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
     Creates:
       - Wazuh agent group 'tenant_<tenant_name>'
       - agent.conf with label: group=tenant_<tenant_name>
+      - OpenSearch Dashboards tenant 'tenant_<tenant_name>'
       - OpenSearch role 'tenant_<tenant_name>_role'
       - Wazuh API policy, role and rule scoped to the group
 
@@ -351,7 +352,17 @@ def create_tenant(tenant):
     else:
         log("No agents yet — inventory DLS will be set to match-none until agents are added")
 
-    # 4. Create OpenSearch role
+    # 4. Create OpenSearch Dashboards tenant
+    log(f"Creating OpenSearch tenant '{group_name(tenant)}' ...")
+    result = indexer("PUT", f"/_plugins/_security/api/tenants/{group_name(tenant)}", {
+        "description": f"Tenant for {tenant}"
+    })
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"Tenant '{group_name(tenant)}' created")
+    else:
+        log(f"Note: {result}")
+
+    # 5. Create OpenSearch role
     rname = role_name(tenant)
     log(f"Creating OpenSearch role '{rname}' ...")
     role = build_role(tenant, agent_ids)
@@ -361,7 +372,7 @@ def create_tenant(tenant):
     else:
         log(f"Note: {result}")
 
-    # 5. Create Wazuh API policy
+    # 6. Create Wazuh API policy
     log(f"Creating Wazuh API policy for '{tenant}' ...")
     wazuh_policy = {
         "name": f"pol_{group_name(tenant)}",
@@ -395,7 +406,7 @@ def create_tenant(tenant):
         if not policy_id:
             log(f"Note: {result}")
 
-    # 6. Create Wazuh API role
+    # 7. Create Wazuh API role
     log(f"Creating Wazuh API role for '{tenant}' ...")
     result = wazuh("POST", "/security/roles", {"name": f"wazuh_{group_name(tenant)}"})
     items = result.get("data", {}).get("affected_items", [])
@@ -412,7 +423,7 @@ def create_tenant(tenant):
         if not wazuh_role_id:
             log(f"Note: {result}")
 
-    # 7. Link policy to role
+    # 8. Link policy to role
     if policy_id and wazuh_role_id:
         log(f"Linking policy to Wazuh API role ...")
         result = wazuh("POST", f"/security/roles/{wazuh_role_id}/policies?policy_ids={policy_id}")
@@ -421,7 +432,7 @@ def create_tenant(tenant):
         else:
             log(f"Note: {result}")
 
-    # 8. Create Wazuh API rule
+    # 9. Create Wazuh API rule
     log(f"Creating Wazuh API rule for '{tenant}' ...")
     wazuh_rule = {
         "name": f"map_{group_name(tenant)}",
@@ -442,7 +453,7 @@ def create_tenant(tenant):
         if not rule_id:
             log(f"Note: {result}")
 
-    # 9. Link rule to role
+    # 10. Link rule to role
     if rule_id and wazuh_role_id:
         log(f"Linking rule to Wazuh API role ...")
         result = wazuh("POST", f"/security/roles/{wazuh_role_id}/rules?rule_ids={rule_id}")
@@ -623,6 +634,10 @@ def delete_tenant(tenant):
     log(f"Deleting role '{rname}' ...")
     indexer("DELETE", f"/_plugins/_security/api/roles/{rname}")
     ok("Role deleted")
+
+    log(f"Deleting OpenSearch tenant '{group_name(tenant)}' ...")
+    indexer("DELETE", f"/_plugins/_security/api/tenants/{group_name(tenant)}")
+    ok("Tenant deleted")
 
     log(f"Deleting Wazuh agent group '{group_name(tenant)}' ...")
     result = wazuh("DELETE", f"/groups?groups_list={group_name(tenant)}")
