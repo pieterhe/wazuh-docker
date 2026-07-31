@@ -626,6 +626,10 @@ def remove_user(tenant, username):
     print(f" Removing user '{username}' from tenant '{tenant}'")
     sep()
 
+    result = indexer("GET", f"/_plugins/_security/api/internalusers/{username}")
+    if username not in result:
+        err(f"User '{username}' not found — no such user, what is this user you are talking about? :-)")
+
     rname = role_name(tenant)
 
     log(f"Removing '{username}' from role mapping '{rname}' ...")
@@ -676,12 +680,15 @@ def delete_tenant(tenant):
     print(" Users are NOT deleted — remove them manually if needed.")
     sep()
 
+    rname = role_name(tenant)
+    result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
+    if rname not in result:
+        err(f"Tenant '{tenant}' not found — no such tenant, nothing to delete.")
+
     ans = input("  Are you sure? (yes/no): ")
     if ans.strip().lower() != "yes":
         print("  Aborted.")
         return
-
-    rname = role_name(tenant)
 
     log(f"Deleting role mapping '{rname}' ...")
     indexer("DELETE", f"/_plugins/_security/api/rolesmapping/{rname}")
