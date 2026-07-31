@@ -186,6 +186,33 @@ def tenant_from_role(role):
     return None
 
 
+def find_wazuh_rule(tenant):
+    """Look up the Wazuh API rule 'map_tenant_<name>' by name.
+    Returns (rule_id, rule_dict) or (None, None) if not found.
+    """
+    rule_name = f"map_{group_name(tenant)}"
+    result = wazuh("GET", "/security/rules?limit=500")
+    for r in result.get("data", {}).get("affected_items", []):
+        if r.get("name") == rule_name:
+            return r["id"], r.get("rule", {})
+    return None, None
+
+
+def update_wazuh_rule_users(tenant, usernames):
+    """Update the Wazuh API rule to FIND on the given list of usernames.
+    Falls back to a placeholder if the list is empty, so the rule never
+    matches a real user.
+    """
+    rule_id, _ = find_wazuh_rule(tenant)
+    if not rule_id:
+        return False, "rule not found"
+    values = usernames if usernames else [f"__placeholder_{tenant}__"]
+    result = wazuh("PUT", f"/security/rules/{rule_id}", {"rule": {"FIND": {"user_name": values}}})
+    if result.get("error") == 0:
+        return True, None
+    return False, result
+
+
 def get_agent_ids_for_group(tenant):
     """Get all agent IDs that belong to the tenant group."""
     result = wazuh("GET", f"/agents?group={group_name(tenant)}&limit=500")
@@ -560,6 +587,20 @@ def add_user(tenant, username):
     else:
         log(f"Note: {result}")
 
+    log(f"Updating Wazuh API rule to include '{username}' ...")
+    _, existing_rule = find_wazuh_rule(tenant)
+    current_rule_users = existing_rule.get("FIND", {}).get("user_name", []) if existing_rule else []
+    if isinstance(current_rule_users, str):
+        current_rule_users = [current_rule_users]
+    current_rule_users = [u for u in current_rule_users if not u.startswith("__placeholder_")]
+    if username not in current_rule_users:
+        current_rule_users.append(username)
+    success, note = update_wazuh_rule_users(tenant, current_rule_users)
+    if success:
+        ok(f"Wazuh API rule updated to include '{username}'")
+    else:
+        log(f"Note: {note}")
+
     log(f"Updating kibana index pattern for tenant '{tenant}' ...")
     update_kibana_alerts_pattern(None, tenant)
 
@@ -599,6 +640,21 @@ def remove_user(tenant, username):
             ok(f"User '{username}' removed from '{rname}'")
         else:
             log(f"Note: {result}")
+
+    log(f"Removing '{username}' from Wazuh API rule ...")
+    _, existing_rule = find_wazuh_rule(tenant)
+    current_rule_users = existing_rule.get("FIND", {}).get("user_name", []) if existing_rule else []
+    if isinstance(current_rule_users, str):
+        current_rule_users = [current_rule_users]
+    if username in current_rule_users:
+        current_rule_users = [u for u in current_rule_users if u != username]
+        success, note = update_wazuh_rule_users(tenant, current_rule_users)
+        if success:
+            ok(f"User '{username}' removed from Wazuh API rule")
+        else:
+            log(f"Note: {note}")
+    else:
+        log(f"User '{username}' not in Wazuh API rule, nothing to do.")
 
     print()
     ans = input(f"  Also delete the OpenSearch user '{username}' entirely? (yes/no): ")
