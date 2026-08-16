@@ -37,8 +37,8 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
  3. Pre-register an agent for the tenant:
       sudo python3 tenant.py enroll-agent <tenant_name> <agent_name>
     Generates a one-time OS-aware install script served at:
-      https://<tenant_name>.zeroed.nl/register/<agent_name>
-    Tenant runs: curl -s https://<tenant>.zeroed.nl/register/<agent_name> | bash
+      https://<tenant_name>.it-security-guys.nl/register/<agent_name>
+    Tenant runs: curl -s https://<tenant>.it-security-guys.nl/register/<agent_name> | bash
     Script deletes itself after use.
     After the agent connects, run sync-role to update the DLS.
 
@@ -53,9 +53,9 @@ Manages Wazuh tenants: create tenant groups, roles, and users.
     Run this again whenever agents are added or removed from the group.
 
  6. Tenant users access the dashboard via:
-      https://<tenant_name>.zeroed.nl
+      https://<tenant_name>.it-security-guys.nl
     Caddy automatically injects the correct tenant header.
-    DNS is handled by the wildcard *.zeroed.nl record.
+    DNS is handled by the wildcard *.it-security-guys.nl record.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  NOTES
@@ -108,7 +108,7 @@ MANAGER_CONTAINER = "single-node-wazuh.manager-1"
 INDEXER_CONTAINER = "single-node-wazuh.indexer-1"
 
 WAZUH_VERSION     = "4.14.5"
-MANAGER_HOST      = "tuxido.zeroed.nl"
+MANAGER_HOST      = "ams-tuxido-se01.it-sg.net"
 REGISTER_DIR      = "/usr/local/ISGservices/register"
 
 # Role naming convention: tenant_{name}_role
@@ -611,7 +611,7 @@ def add_user(tenant, username):
     print(f"  │  CREDENTIALS — print once, store safely  │")
     print(f"  │  Username : {username:<29} │")
     print(f"  │  Password : {password:<29} │")
-    print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
+    print(f"  │  URL      : https://{tenant}.it-security-guys.nl  │")
     print(f"  └─────────────────────────────────────────┘")
     print()
     print(f"  After the user logs in for the first time, run:")
@@ -1033,11 +1033,11 @@ def enroll_agent(tenant, agent_name):
     print()
     print(f"  Linux/macOS — send this ONE command to the tenant:")
     print()
-    print(f"  curl -s https://{tenant}.zeroed.nl/register/{agent_name} | bash")
+    print(f"  curl -s https://{tenant}.it-security-guys.nl/register/{agent_name} | bash")
     print()
     print(f"  Windows (elevated PowerShell) — send this ONE command to the tenant:")
     print()
-    print(f"  iex (irm https://{tenant}.zeroed.nl/register/{agent_name})")
+    print(f"  iex (irm https://{tenant}.it-security-guys.nl/register/{agent_name})")
     print()
     print(f"  The script is OS-aware (Linux Debian/RPM, macOS Intel/Apple Silicon).")
     print(f"  After the agent connects, run:")

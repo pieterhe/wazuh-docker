@@ -1,5 +1,9 @@
-(zeroed_nl_tls) {
-	tls /certs/zeroed_nl/fullchain.pem /certs/zeroed_nl/privkey.pem
+(it_security_guys_nl_tls) {
+	tls /certs/it_security_guys_nl/fullchain.pem /certs/it_security_guys_nl/privkey.pem
+}
+
+(it_sg_net_tls) {
+	tls /certs/it_sg_net/fullchain.pem /certs/it_sg_net/privkey.pem
 }
 
 (wazuh_proxy) {
@@ -12,18 +16,13 @@
 	}
 }
 
-admin.zeroed.nl {
-	import zeroed_nl_tls
+ams-tuxido-se01.it-sg.net {
+	import it_sg_net_tls
 	import wazuh_proxy
 }
 
-tuxido.zeroed.nl {
-	import zeroed_nl_tls
-	import wazuh_proxy
-}
-
-*.zeroed.nl {
-	import zeroed_nl_tls
+*.it-security-guys.nl {
+	import it_security_guys_nl_tls
 
 	# PowerShell UA → serve .ps1 file
 	@ps1ua {
