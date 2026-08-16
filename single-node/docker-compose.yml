@@ -228,6 +228,10 @@ services:
         target: /wazuh-config-mount/etc/ossec.conf
         bind:
           create_host_path: true
+      - type: bind
+        source: /usr/local/ISGservices/wazuh-docker/single-node/config/wazuh_rules/local_rules.xml
+        target: /var/ossec/etc/rules/local_rules.xml
+        read_only: true
 
   caddy:
     image: caddy:2-alpine
