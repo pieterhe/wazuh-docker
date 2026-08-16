@@ -1,0 +1,1648 @@
+#!/usr/bin/env python3
+"""
+tenant.py
+Manages Wazuh tenants: create tenant groups, roles, and users.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  sudo python3 tenant.py create-tenant <tenant_name>
+  sudo python3 tenant.py add-user <tenant_name> <username>
+  sudo python3 tenant.py remove-user <tenant_name> <username>
+  sudo python3 tenant.py delete-tenant <tenant_name>
+  sudo python3 tenant.py list-tenants
+  sudo python3 tenant.py list-users <tenant_name>
+  sudo python3 tenant.py sync-role <tenant_name>
+  sudo python3 tenant.py enroll-agent <tenant_name> <agent_name>
+  sudo python3 tenant.py delete-agent <tenant_name> <agent_name>
+  sudo python3 tenant.py create-sca-index <tenant_name>
+  sudo python3 tenant.py sync-sca <tenant_name>
+  sudo python3 tenant.py create-sca-dataview <tenant_name>
+  
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ NEW TENANT LIFECYCLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. Create the tenant:
+      sudo python3 tenant.py create-tenant <tenant_name>
+    Creates:
+      - Wazuh agent group 'tenant_<tenant_name>'
+      - agent.conf with label: group=tenant_<tenant_name>
+      - OpenSearch role 'tenant_<tenant_name>_role'
+      - Wazuh API policy, role and rule scoped to the group
+
+ 2. Add a dashboard user:
+      sudo python3 tenant.py add-user <tenant_name> <username>
+    Creates the OpenSearch user with a generated password and maps
+    them to the tenant role. Password is printed once — store safely.
+    After the user logs in for the first time, run sync-role.
+
+ 3. Pre-register an agent for the tenant:
+      sudo python3 tenant.py enroll-agent <tenant_name> <agent_name>
+    Generates a one-time OS-aware install script served at:
+      https://<tenant_name>.zeroed.nl/register/<agent_name>
+    Tenant runs: curl -s https://<tenant>.zeroed.nl/register/<agent_name> | bash
+    Script deletes itself after use.
+    After the agent connects, run sync-role to update the DLS.
+
+ 4. Delete a pre-registered agent (if not yet used):
+      sudo python3 tenant.py delete-agent <tenant_name> <agent_name>
+
+ 5. Sync the role after agents connect or users log in:
+      sudo python3 tenant.py sync-role <tenant_name>
+    Updates:
+      - Inventory/vulnerability DLS with current agent IDs
+      - Kibana alerts index pattern for all tenant users
+    Run this again whenever agents are added or removed from the group.
+
+ 6. Tenant users access the dashboard via:
+      https://<tenant_name>.zeroed.nl
+    Caddy automatically injects the correct tenant header.
+    DNS is handled by the wildcard *.zeroed.nl record.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ - Alert isolation: Filebeat routes alerts to wazuh-alerts-*-tenant_<name>-*
+   Legacy alert indices matching wazuh-alerts-*-* remain protected by agent.id DLS.
+ - Inventory/IT Hygiene: isolated by agent.id DLS (Wazuh does not write
+   group labels to inventory indices — see github.com/wazuh/wazuh/issues/33098)
+ - Monitoring: isolated by group.keyword DLS
+ - Run sync-role after any agent group membership change.
+"""
+
+import sys
+import os
+import json
+import subprocess
+import base64
+import requests
+
+
+def _load_dotenv():
+    env_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+
+def _require_env(key):
+    val = os.environ.get(key)
+    if not val:
+        sys.exit(f"Error: {key} not set — add it to single-node/.env")
+    return val
+
+
+_load_dotenv()
+
+# ── Configuration ─────────────────────────────────────────────
+WAZUH_API_URL     = "https://localhost:55000"
+WAZUH_API_USER    = os.environ.get("WAZUH_API_USER", "wazuh-wui")
+WAZUH_API_PASS    = _require_env("WAZUH_API_PASS")
+
+INDEXER_URL       = "https://localhost:9200"
+INDEXER_USER      = os.environ.get("INDEXER_USER", "admin")
+INDEXER_PASS      = _require_env("INDEXER_PASS")
+
+MANAGER_CONTAINER = "single-node-wazuh.manager-1"
+INDEXER_CONTAINER = "single-node-wazuh.indexer-1"
+
+DASHBOARD_CONTAINER = "single-node-wazuh.dashboard-1"
+DASHBOARD_URL = "https://localhost:5601"
+
+WAZUH_VERSION     = "4.14.5"
+MANAGER_HOST      = "tuxido.zeroed.nl"
+REGISTER_DIR      = "/usr/local/ISGservices/register"
+TEMPLATE_DIR      = "/usr/local/ISGservices/wazuh-docker/single-node/scripts/templates"
+
+# Role naming convention: tenant_{name}_role
+ROLE_PREFIX = "tenant_"
+ROLE_SUFFIX = "_role"
+# ─────────────────────────────────────────────────────────────
+
+
+# ── HTTP helpers ──────────────────────────────────────────────
+def indexer(method, endpoint, body=None):
+    """Call OpenSearch API via docker exec, using netrc to avoid password escaping issues."""
+    inner = f'curl -sk -X {method} --netrc-file /tmp/.netrc "{INDEXER_URL}{endpoint}"'
+    if body:
+        body_escaped = json.dumps(body).replace("'", "'\\''")
+        inner += f" -H 'Content-Type: application/json' -d '{body_escaped}'"
+    cmd = [
+        "docker", "exec", INDEXER_CONTAINER, "sh", "-c",
+        f"echo 'machine localhost login {INDEXER_USER} password {INDEXER_PASS}' > /tmp/.netrc && "
+        f"chmod 600 /tmp/.netrc && "
+        f"{inner} ; "
+        f"rm -f /tmp/.netrc"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"raw": result.stdout.strip()}
+
+def dashboard(method, endpoint, tenant, body=None):
+    """
+    Call the Wazuh Dashboard API inside the dashboard container.
+
+    INDEXER_USER and INDEXER_PASS are also used for Dashboard
+    authentication.
+    """
+    inner = (
+        f'curl -sk -X {method} '
+        f'--netrc-file /tmp/.netrc '
+        f'-H "osd-xsrf: true" '
+        f'-H "securitytenant: {tenant}" '
+        f'"{DASHBOARD_URL}{endpoint}"'
+    )
+
+    if body is not None:
+        body_escaped = json.dumps(body).replace("'", "'\\''")
+        inner += (
+            " -H 'Content-Type: application/json'"
+            f" -d '{body_escaped}'"
+        )
+
+    cmd = [
+        "docker",
+        "exec",
+        DASHBOARD_CONTAINER,
+        "sh",
+        "-c",
+        (
+            f"echo 'machine localhost login {INDEXER_USER} "
+            f"password {INDEXER_PASS}' > /tmp/.netrc && "
+            f"chmod 600 /tmp/.netrc && "
+            f"{inner} ; "
+            f"rm -f /tmp/.netrc"
+        )
+    ]
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True
+    )
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {
+            "raw": result.stdout.strip(),
+            "stderr": result.stderr.strip()
+        }
+
+def dashboard_import_ndjson(tenant, source_file):
+    """
+    Import an NDJSON Saved Objects file into a Dashboard tenant.
+    """
+    dashboard_tenant = group_name(tenant)
+    container_file = "/tmp/dashboard-import.ndjson"
+
+    copy_result = subprocess.run(
+        [
+            "docker",
+            "cp",
+            source_file,
+            f"{DASHBOARD_CONTAINER}:{container_file}"
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if copy_result.returncode != 0:
+        return {
+            "success": False,
+            "error": copy_result.stderr.strip()
+        }
+
+    inner = (
+        f"echo 'machine localhost login {INDEXER_USER} "
+        f"password {INDEXER_PASS}' > /tmp/.netrc && "
+        f"chmod 600 /tmp/.netrc && "
+        f"curl -sk --netrc-file /tmp/.netrc "
+        f'-H "osd-xsrf: true" '
+        f'-H "securitytenant: {dashboard_tenant}" '
+        f'-F "file=@{container_file}" '
+        f'"{DASHBOARD_URL}/api/saved_objects/_import?overwrite=true"; '
+        f"rm -f /tmp/.netrc {container_file}"
+    )
+
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            DASHBOARD_CONTAINER,
+            "sh",
+            "-c",
+            inner
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "raw": result.stdout.strip(),
+            "stderr": result.stderr.strip()
+        }
+
+def wazuh_token():
+    """Get Wazuh API JWT token."""
+    creds = base64.b64encode(f"{WAZUH_API_USER}:{WAZUH_API_PASS}".encode()).decode()
+    inner = f'curl -sk -X POST -H "Authorization: Basic {creds}" "{WAZUH_API_URL}/security/user/authenticate"'
+    cmd = ["docker", "exec", MANAGER_CONTAINER, "sh", "-c", inner]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)["data"]["token"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        raise RuntimeError(f"Failed to get Wazuh API token: {result.stdout.strip()}")
+
+
+def wazuh(method, endpoint, body=None, content_type="application/json"):
+    """Call Wazuh manager API via docker exec."""
+    token = wazuh_token()
+    if body:
+        body_str = (json.dumps(body) if content_type == "application/json" else body).replace("'", "'\\''")
+        inner = (
+            f'curl -sk -X {method} '
+            f'-H "Authorization: Bearer {token}" '
+            f"-H 'Content-Type: {content_type}' "
+            f"-d '{body_str}' "
+            f'"{WAZUH_API_URL}{endpoint}"'
+        )
+    else:
+        inner = f'curl -sk -X {method} -H "Authorization: Bearer {token}" "{WAZUH_API_URL}{endpoint}"'
+    result = subprocess.run(["docker", "exec", MANAGER_CONTAINER, "sh", "-c", inner], capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"raw": result.stdout.strip()}
+
+def role_name(tenant):
+    return f"{ROLE_PREFIX}{tenant}{ROLE_SUFFIX}"
+
+def alerts_index_pattern(tenant):
+    major_version = WAZUH_VERSION.split(".", 1)[0]
+    return f"wazuh-alerts-{major_version}.x-{group_name(tenant)}-*"
+
+def group_name(tenant):
+    """The Wazuh group name is always tenant_<name>."""
+    return f"tenant_{tenant}"
+
+def sca_index_name(tenant):
+    """Return the tenant-specific SCA summary index name."""
+    return f"wazuh-sca-summary-{group_name(tenant)}"
+
+def sca_index_mapping():
+    """Return the mapping used by the tenant-specific SCA summary index."""
+    return {
+        "properties": {
+            "@timestamp": {
+                "type": "date"
+            },
+            "agent": {
+                "properties": {
+                    "id": {
+                        "type": "keyword"
+                    },
+                    "name": {
+                        "type": "text",
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword"
+                            }
+                        }
+                    }
+                }
+            },
+            "os": {
+                "properties": {
+                    "name": {
+                        "type": "text",
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword"
+                            }
+                        }
+                    },
+                    "version": {
+                        "type": "keyword"
+                    }
+                }
+            },
+            "endpoint_type": {
+                "type": "keyword"
+            },
+            "policy": {
+                "properties": {
+                    "id": {
+                        "type": "keyword"
+                    },
+                    "name": {
+                        "type": "text",
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword"
+                            }
+                        }
+                    }
+                }
+            },
+            "score": {
+                "type": "integer"
+            },
+            "passed": {
+                "type": "integer"
+            },
+            "failed": {
+                "type": "integer"
+            },
+            "invalid": {
+                "type": "integer"
+            },
+            "total_checks": {
+                "type": "integer"
+            },
+            "passed_percentage": {
+                "type": "float"
+            },
+            "failed_percentage": {
+                "type": "float"
+            },
+            "scan_start": {
+                "type": "date"
+            },
+            "scan_end": {
+                "type": "date"
+            },
+            "collected_at": {
+                "type": "date"
+            }
+        }
+    }
+
+
+def create_sca_index(tenant):
+    """
+    Create or verify the tenant-specific SCA summary index.
+
+    This function does not change tenant roles, users, groups,
+    dashboards or existing indices.
+    """
+    index_name = sca_index_name(tenant)
+
+    sep()
+    print(f" Creating SCA index for tenant: {tenant}")
+    sep()
+
+    # Check that the tenant role already exists.
+    rname = role_name(tenant)
+    role_result = indexer(
+        "GET",
+        f"/_plugins/_security/api/roles/{rname}"
+    )
+
+    if rname not in role_result:
+        err(
+            f"Tenant '{tenant}' does not exist. "
+            f"Expected role '{rname}'."
+        )
+
+    ok(f"Tenant role '{rname}' exists")
+
+    # Check whether the SCA index already exists.
+    mapping_result = indexer(
+        "GET",
+        f"/{index_name}/_mapping"
+    )
+
+    if index_name in mapping_result:
+        ok(f"SCA index '{index_name}' already exists")
+
+        # Safely add any missing mapping fields.
+        result = indexer(
+            "PUT",
+            f"/{index_name}/_mapping",
+            sca_index_mapping()
+        )
+
+        if result.get("acknowledged") is True:
+            ok("SCA mapping checked/updated")
+        else:
+            log(f"Mapping response: {result}")
+
+        sep()
+        print(" SCA index check complete.")
+        sep()
+        print()
+        return
+
+    # Create a new index with the existing SCA mapping.
+    log(f"Creating index '{index_name}' ...")
+
+    body = {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0
+        },
+        "mappings": sca_index_mapping()
+    }
+
+    result = indexer(
+        "PUT",
+        f"/{index_name}",
+        body
+    )
+
+    if result.get("acknowledged") is True:
+        ok(f"SCA index '{index_name}' created")
+    elif result.get("error", {}).get("type") == "resource_already_exists_exception":
+        ok(f"SCA index '{index_name}' already exists")
+    else:
+        log(f"Indexer response: {result}")
+        err(f"Could not create SCA index '{index_name}'")
+
+    sep()
+    print(" SCA index creation complete.")
+    sep()
+    print()
+
+def sync_sca_permissions(tenant):
+    """
+    Add tenant-specific SCA index permissions to an existing OpenSearch role.
+
+    Existing role permissions are preserved. This function only adds the
+    missing SCA index permission and does not use build_role().
+    """
+    sep()
+    print(f" Syncing SCA permissions for tenant: {tenant}")
+    sep()
+
+    rname = role_name(tenant)
+    index_pattern = f"{sca_index_name(tenant)}*"
+
+    # Retrieve the existing tenant role.
+    log(f"Reading existing role '{rname}' ...")
+    result = indexer(
+        "GET",
+        f"/_plugins/_security/api/roles/{rname}"
+    )
+
+    if rname not in result:
+        err(
+            f"Tenant role '{rname}' does not exist. "
+            f"Create the tenant first."
+        )
+
+    role = result[rname]
+
+    if not isinstance(role, dict):
+        err(f"Invalid role response received for '{rname}': {result}")
+
+    # Remove read-only metadata returned by the GET request.
+    # OpenSearch rejects these fields when updating a role with PUT.
+    for read_only_key in ("static", "hidden", "reserved"):
+        role.pop(read_only_key, None)
+
+    ok(f"Existing role '{rname}' loaded")
+
+    # Preserve all existing index permissions.
+    index_permissions = role.get("index_permissions")
+
+    if not isinstance(index_permissions, list):
+        err(
+            f"Role '{rname}' does not contain a valid "
+            f"'index_permissions' list."
+        )
+
+    # Check whether the exact SCA permission already exists.
+    for permission in index_permissions:
+        patterns = permission.get("index_patterns", [])
+
+        if index_pattern in patterns:
+            ok(
+                f"SCA permission for '{index_pattern}' "
+                f"already exists"
+            )
+
+            sep()
+            print(" No role changes required.")
+            sep()
+            print()
+            return
+
+    # Add only the tenant-specific SCA index permission.
+    sca_permission = {
+        "index_patterns": [
+            index_pattern
+        ],
+        "dls": "",
+        "fls": [],
+        "masked_fields": [],
+        "allowed_actions": [
+            "read",
+            "indices:data/read/search"
+        ]
+    }
+
+    index_permissions.append(sca_permission)
+    role["index_permissions"] = index_permissions
+
+    log(f"Adding read permission for '{index_pattern}' ...")
+
+    update_result = indexer(
+        "PUT",
+        f"/_plugins/_security/api/roles/{rname}",
+        role
+    )
+
+    if update_result.get("status") in ("OK", "CREATED"):
+        ok(f"SCA permission added to role '{rname}'")
+    else:
+        log(f"Indexer response: {update_result}")
+        err(f"Could not update role '{rname}'")
+
+    sep()
+    print(" SCA permission sync complete.")
+    sep()
+    print()
+
+def create_sca_dataview(tenant):
+    """
+    Create or update the tenant-specific SCA Data View.
+
+    Data View:
+        wazuh-sca-summary-tenant_<tenant>*
+
+    Time field:
+        @timestamp
+    """
+    dashboard_tenant = group_name(tenant)
+    dataview_id = sca_index_name(tenant)
+    dataview_title = f"{sca_index_name(tenant)}*"
+
+    sep()
+    print(f" Creating SCA Data View for tenant: {tenant}")
+    sep()
+
+    body = {
+        "attributes": {
+            "title": dataview_title,
+            "timeFieldName": "@timestamp"
+        }
+    }
+
+    result = dashboard(
+        "POST",
+        (
+            f"/api/saved_objects/index-pattern/"
+            f"{dataview_id}?overwrite=true"
+        ),
+        dashboard_tenant,
+        body
+    )
+
+    if result.get("id") == dataview_id:
+        ok(f"Data View '{dataview_title}' created/updated")
+        ok("Time field set to '@timestamp'")
+    else:
+        log(f"Dashboard response: {result}")
+        err(
+            f"Could not create SCA Data View "
+            f"for tenant '{tenant}'"
+        )
+
+    sep()
+    print(" SCA Data View creation complete.")
+    sep()
+    print()
+
+def tenant_from_role(role):
+    if role.startswith(ROLE_PREFIX) and role.endswith(ROLE_SUFFIX):
+        return role[len(ROLE_PREFIX):-len(ROLE_SUFFIX)]
+    return None
+
+
+def get_agent_ids_for_group(tenant):
+    """Get all agent IDs that belong to the tenant group."""
+    result = wazuh("GET", f"/agents?group={group_name(tenant)}&limit=500")
+    agents = result.get("data", {}).get("affected_items", [])
+    return [a["id"] for a in agents]
+
+
+def inventory_dls(agent_ids):
+    """Build DLS query for inventory indices based on agent IDs."""
+    if not agent_ids:
+        return json.dumps({"match_none": {}})
+    if len(agent_ids) == 1:
+        return json.dumps({"term": {"agent.id": agent_ids[0]}})
+    return json.dumps({"terms": {"agent.id": agent_ids}})
+
+
+def get_kibana_tenant_index(tenant):
+    """Find the kibana index for a given tenant name.
+    OpenSearch strips underscores from tenant names in kibana index names:
+    e.g. tenant_picard -> tenantpicard
+    """
+    result = indexer("GET", "/_cat/indices/.kibana_*?h=index&format=json")
+    if not isinstance(result, list):
+        return None
+    candidates = [
+        group_name(tenant).replace("_", "").lower(),   # tenant_picard -> tenantpicard
+        tenant.replace("_", "").lower(),               # picard -> picard (fallback)
+    ]
+    for item in result:
+        idx = item.get("index", "").lower()
+        for candidate in candidates:
+            if f"_{candidate}_" in idx:
+                return item.get("index")
+    return None
+
+
+def update_kibana_alerts_pattern(username, tenant):
+    """Update the wazuh-alerts-* index pattern in the tenant's kibana space."""
+    kibana_index = get_kibana_tenant_index(tenant)
+    if not kibana_index:
+        log(f"Could not find kibana index for tenant '{tenant}' — skipping index pattern update")
+        log("A user must log in first to create the kibana space, then run sync-role")
+        return False
+    result = indexer("POST", f"/{kibana_index}/_update/index-pattern:wazuh-alerts-*", {
+        "doc": {
+            "index-pattern": {
+                "title": alerts_index_pattern(tenant)
+            }
+        }
+    })
+    if result.get("result") in ("updated", "noop"):
+        ok(f"Kibana alerts index pattern updated to '{alerts_index_pattern(tenant)}'")
+        return True
+    else:
+        log(f"Note: {result}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+
+
+# ── Output helpers ────────────────────────────────────────────
+SEP = "─" * 44
+
+def sep():    print(f"\n{SEP}")
+def ok(msg):  print(f"  [OK]  {msg}")
+def log(msg): print(f"        {msg}")
+def err(msg): print(f"  [ERR] {msg}"); sys.exit(1)
+# ─────────────────────────────────────────────────────────────
+
+
+# ── build_role ────────────────────────────────────────────────
+def build_role(tenant, agent_ids):
+    """Build the OpenSearch role definition for a tenant."""
+    return {
+        "description": f"Role for tenant {tenant}",
+        "cluster_permissions": ["cluster_composite_ops"],
+        "index_permissions": [
+            {
+                "index_patterns": [alerts_index_pattern(tenant)],
+                "dls": "",
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": ["wazuh-alerts-*-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": ["wazuh-monitoring-*"],
+                "dls": json.dumps({"term": {"group.keyword": group_name(tenant)}}),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": ["wazuh-states-inventory-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": ["wazuh-states-vulnerabilities-*"],
+                "dls": inventory_dls(agent_ids),
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": ["wazuh-statistics-*"],
+                "dls": "",
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": ["read", "indices:data/read/search"]
+            },
+            {
+                "index_patterns": [
+                    f"{sca_index_name(tenant)}*"
+                ],
+                "dls": "",
+                "fls": [],
+                "masked_fields": [],
+                "allowed_actions": [
+                    "read",
+                    "indices:data/read/search"
+                ]
+            }
+        ],
+        "tenant_permissions": [
+            {
+                "tenant_patterns": [group_name(tenant)],
+                "allowed_actions": ["kibana_all_write"]
+            }
+        ]
+    }
+# ─────────────────────────────────────────────────────────────
+
+
+# ── create-tenant ─────────────────────────────────────────────
+def create_tenant(tenant):
+    sep()
+    print(f" Creating tenant: {tenant}")
+    sep()
+
+    # 1. Create Wazuh agent group
+    log(f"Creating Wazuh agent group '{group_name(tenant)}' ...")
+    result = wazuh("POST", "/groups", {"group_id": group_name(tenant)})
+    if result.get("data", {}).get("affected_items"):
+        ok(f"Agent group '{group_name(tenant)}' created")
+    else:
+        log(f"Note: {result}")
+
+    # 2. Upload agent.conf with label
+    log(f"Uploading agent.conf with label group={group_name(tenant)} ...")
+    xml = (
+        '<agent_config>\n'
+        '  <labels>\n'
+        f'    <label key="group">{group_name(tenant)}</label>\n'
+        '  </labels>\n'
+        '</agent_config>'
+    )
+    result = wazuh("PUT", f"/groups/{group_name(tenant)}/configuration", body=xml, content_type="application/xml")
+    if "successfully" in str(result):
+        ok("agent.conf uploaded")
+    else:
+        log(f"Note: {result}")
+
+    # 3. Look up agent IDs (likely empty at creation time)
+    log(f"Looking up agents in group '{group_name(tenant)}' ...")
+    agent_ids = get_agent_ids_for_group(tenant)
+    if agent_ids:
+        ok(f"Found agents: {agent_ids}")
+    else:
+        log("No agents yet — inventory DLS will be set to match-none until agents are added")
+        
+    # 4. Create Tenant (toegevoegd door Jurgen)
+    tname = group_name(tenant)
+    log(f"Creating OpenSearch tenant '{tname}' ...")
+    result = indexer(
+        "PUT",
+        f"/_plugins/_security/api/tenants/{tname}",
+        {"description": f"Dashboard tenant for {tenant}"}
+    )
+
+    # 5. Create OpenSearch role
+    rname = role_name(tenant)
+    log(f"Creating OpenSearch role '{rname}' ...")
+    role = build_role(tenant, agent_ids)
+    result = indexer("PUT", f"/_plugins/_security/api/roles/{rname}", role)
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"Role '{rname}' created")
+    else:
+        log(f"Note: {result}")
+
+    # 6. Create Wazuh API policy
+    log(f"Creating Wazuh API policy for '{tenant}' ...")
+    wazuh_policy = {
+        "name": f"pol_{group_name(tenant)}",
+        "policy": {
+            "actions": [
+                "agent:read", "group:read", "ciscat:read", "sca:read",
+                "syscheck:read", "syscollector:read", "rootcheck:read",
+                "mitre:read", "rules:read", "decoders:read", "lists:read",
+                "cluster:status", "manager:read"
+            ],
+            "resources": [
+                f"agent:group:{group_name(tenant)}",
+                f"group:id:{group_name(tenant)}"
+            ],
+            "effect": "allow"
+        }
+    }
+    result = wazuh("POST", "/security/policies", wazuh_policy)
+    items = result.get("data", {}).get("affected_items", [])
+    policy_id = items[0].get("id") if items else None
+    if policy_id:
+        ok(f"Wazuh API policy created (id={policy_id})")
+    else:
+        # Fall back to looking up an existing policy with this name
+        all_policies = wazuh("GET", "/security/policies?limit=500")
+        for p in all_policies.get("data", {}).get("affected_items", []):
+            if p.get("name") == f"pol_{group_name(tenant)}":
+                policy_id = p["id"]
+                ok(f"Wazuh API policy already exists (id={policy_id})")
+                break
+        if not policy_id:
+            log(f"Note: {result}")
+
+    # 7. Create Wazuh API role
+    log(f"Creating Wazuh API role for '{tenant}' ...")
+    result = wazuh("POST", "/security/roles", {"name": f"wazuh_{group_name(tenant)}"})
+    items = result.get("data", {}).get("affected_items", [])
+    wazuh_role_id = items[0].get("id") if items else None
+    if wazuh_role_id:
+        ok(f"Wazuh API role created (id={wazuh_role_id})")
+    else:
+        all_roles = wazuh("GET", "/security/roles?limit=500")
+        for r in all_roles.get("data", {}).get("affected_items", []):
+            if r.get("name") == f"wazuh_{group_name(tenant)}":
+                wazuh_role_id = r["id"]
+                ok(f"Wazuh API role already exists (id={wazuh_role_id})")
+                break
+        if not wazuh_role_id:
+            log(f"Note: {result}")
+
+    # 8. Link policy to role
+    if policy_id and wazuh_role_id:
+        log(f"Linking policy to Wazuh API role ...")
+        result = wazuh("POST", f"/security/roles/{wazuh_role_id}/policies?policy_ids={policy_id}")
+        if result.get("error") == 0:
+            ok("Policy linked to role")
+        else:
+            log(f"Note: {result}")
+
+    # 9. Create Wazuh API rule
+    log(f"Creating Wazuh API rule for '{tenant}' ...")
+    wazuh_rule = {
+        "name": f"map_{group_name(tenant)}",
+        "rule": {"FIND": {"user_name": f"__placeholder_{tenant}__"}}
+    }
+    result = wazuh("POST", "/security/rules", wazuh_rule)
+    items = result.get("data", {}).get("affected_items", [])
+    rule_id = items[0].get("id") if items else None
+    if rule_id:
+        ok(f"Wazuh API rule created (id={rule_id}) — update it when adding users")
+    else:
+        all_rules = wazuh("GET", "/security/rules?limit=500")
+        for r in all_rules.get("data", {}).get("affected_items", []):
+            if r.get("name") == f"map_{group_name(tenant)}":
+                rule_id = r["id"]
+                ok(f"Wazuh API rule already exists (id={rule_id})")
+                break
+        if not rule_id:
+            log(f"Note: {result}")
+
+    # 10. Link rule to role
+    if rule_id and wazuh_role_id:
+        log(f"Linking rule to Wazuh API role ...")
+        result = wazuh("POST", f"/security/roles/{wazuh_role_id}/rules?rule_ids={rule_id}")
+        if result.get("error") == 0:
+            ok("Rule linked to role")
+        else:
+            log(f"Note: {result}")
+
+    # 11. Create tenant-specific SCA index
+    create_sca_index(tenant)
+
+    # 12. Ensure tenant role has access to the SCA index
+    sync_sca_permissions(tenant)
+
+    # 13. Create Dataview
+    create_sca_dataview(tenant)
+    
+    # 14. Import Dashboard Template
+    import_dashboard_template(tenant)
+
+    sep()
+    print(f" Tenant '{tenant}' is ready.")
+    print(f" Add users with: sudo python3 tenant.py add-user {tenant} <username>")
+    print(f" Enroll agents with: sudo python3 tenant.py enroll-agent {tenant} <agent_name>")
+    sep()
+    print()
+
+
+# ── sync-role ─────────────────────────────────────────────────
+def sync_role(tenant):
+    """Update inventory DLS and kibana index patterns based on current group members."""
+    sep()
+    print(f" Syncing role for tenant: {tenant}")
+    sep()
+
+    rname = role_name(tenant)
+
+    result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
+    if rname not in result:
+        err(f"Tenant '{tenant}' does not exist.")
+
+    log(f"Looking up agents in group '{group_name(tenant)}' ...")
+    agent_ids = get_agent_ids_for_group(tenant)
+    if agent_ids:
+        ok(f"Found agents: {agent_ids}")
+    else:
+        log("No agents in group — inventory DLS will be set to match-none")
+
+    log(f"Updating role '{rname}' ...")
+    role = build_role(tenant, agent_ids)
+    result = indexer("PUT", f"/_plugins/_security/api/roles/{rname}", role)
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"Role '{rname}' updated with agent IDs: {agent_ids}")
+    else:
+        log(f"Note: {result}")
+
+    log(f"Updating kibana index pattern for tenant '{tenant}' ...")
+    update_kibana_alerts_pattern(None, tenant)
+
+    sep()
+    print(f" Sync complete.")
+    sep()
+    print()
+
+
+# ── add-user ──────────────────────────────────────────────────
+def generate_password():
+    """Generate a strong random password."""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + "!@#%^&*"
+    while True:
+        pwd = ''.join(secrets.choice(alphabet) for _ in range(20))
+        if (any(c.islower() for c in pwd) and
+            any(c.isupper() for c in pwd) and
+            any(c.isdigit() for c in pwd) and
+            any(c in "!@#%^&*" for c in pwd)):
+            return pwd
+
+
+def add_user(tenant, username):
+    sep()
+    print(f" Adding user '{username}' to tenant '{tenant}'")
+    sep()
+
+    rname = role_name(tenant)
+
+    result = indexer("GET", f"/_plugins/_security/api/roles/{rname}")
+    if rname not in result:
+        err(f"Tenant '{tenant}' does not exist. Create it first with create-tenant.")
+
+    password = generate_password()
+
+    log(f"Creating OpenSearch user '{username}' ...")
+    user = {
+        "password": password,
+        "opendistro_security_roles": [],
+        "backend_roles": [],
+        "attributes": {"tenant": tenant}
+    }
+    result = indexer("PUT", f"/_plugins/_security/api/internalusers/{username}", user)
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"User '{username}' created")
+    else:
+        log(f"Note: {result}")
+
+    log(f"Mapping '{username}' to role '{rname}' ...")
+    existing = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
+    current_users = existing.get(rname, {}).get("users", [])
+    if username not in current_users:
+        current_users.append(username)
+
+    result = indexer("PUT", f"/_plugins/_security/api/rolesmapping/{rname}", {"users": current_users})
+    if result.get("status") in ("CREATED", "OK"):
+        ok(f"User '{username}' mapped to '{rname}'")
+    else:
+        log(f"Note: {result}")
+
+    log(f"Updating kibana index pattern for tenant '{tenant}' ...")
+    update_kibana_alerts_pattern(None, tenant)
+
+    sep()
+    print(f" User '{username}' added to tenant '{tenant}'.")
+    print()
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  CREDENTIALS — print once, store safely  │")
+    print(f"  │  Username : {username:<29} │")
+    print(f"  │  Password : {password:<29} │")
+    print(f"  │  URL      : https://{tenant}.zeroed.nl  │")
+    print(f"  └─────────────────────────────────────────┘")
+    print()
+    print(f"  After the user logs in for the first time, run:")
+    print(f"  sudo python3 tenant.py sync-role {tenant}")
+    sep()
+    print()
+
+
+# ── remove-user ───────────────────────────────────────────────
+def remove_user(tenant, username):
+    sep()
+    print(f" Removing user '{username}' from tenant '{tenant}'")
+    sep()
+
+    rname = role_name(tenant)
+
+    log(f"Removing '{username}' from role mapping '{rname}' ...")
+    existing = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
+    current_users = existing.get(rname, {}).get("users", [])
+    if username not in current_users:
+        log(f"User '{username}' is not mapped to '{rname}', nothing to do.")
+    else:
+        current_users.remove(username)
+        result = indexer("PUT", f"/_plugins/_security/api/rolesmapping/{rname}", {"users": current_users})
+        if result.get("status") in ("CREATED", "OK"):
+            ok(f"User '{username}' removed from '{rname}'")
+        else:
+            log(f"Note: {result}")
+
+    print()
+    ans = input(f"  Also delete the OpenSearch user '{username}' entirely? (yes/no): ")
+    if ans.strip().lower() == "yes":
+        indexer("DELETE", f"/_plugins/_security/api/internalusers/{username}")
+        ok(f"User '{username}' deleted")
+
+    sep()
+    print(" Done.")
+    sep()
+    print()
+
+
+# ── delete-tenant ─────────────────────────────────────────────
+def delete_tenant(tenant):
+    sep()
+    print(f" Deleting tenant: {tenant}")
+    print(" WARNING: Removes the group, role and role mapping.")
+    print(" Users are NOT deleted — remove them manually if needed.")
+    sep()
+
+    ans = input("  Are you sure? (yes/no): ")
+    if ans.strip().lower() != "yes":
+        print("  Aborted.")
+        return
+
+    rname = role_name(tenant)
+
+    log(f"Deleting role mapping '{rname}' ...")
+    indexer("DELETE", f"/_plugins/_security/api/rolesmapping/{rname}")
+    ok("Role mapping deleted")
+
+    log(f"Deleting role '{rname}' ...")
+    indexer("DELETE", f"/_plugins/_security/api/roles/{rname}")
+    ok("Role deleted")
+
+    log(f"Deleting Wazuh agent group '{group_name(tenant)}' ...")
+    result = wazuh("DELETE", f"/groups?groups_list={group_name(tenant)}")
+    if result.get("error") == 0:
+        ok("Agent group deleted")
+    else:
+        log(f"Note: {result}")
+
+    log(f"Deleting Wazuh API policy 'pol_{group_name(tenant)}' ...")
+    all_policies = wazuh("GET", "/security/policies?limit=500")
+    for p in all_policies.get("data", {}).get("affected_items", []):
+        if p.get("name") == f"pol_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/policies?policy_ids={p['id']}")
+            ok(f"Wazuh API policy deleted (id={p['id']})")
+            break
+    else:
+        log("Wazuh API policy not found, skipping")
+
+    log(f"Deleting Wazuh API role 'wazuh_{group_name(tenant)}' ...")
+    all_roles = wazuh("GET", "/security/roles?limit=500")
+    for r in all_roles.get("data", {}).get("affected_items", []):
+        if r.get("name") == f"wazuh_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/roles?role_ids={r['id']}")
+            ok(f"Wazuh API role deleted (id={r['id']})")
+            break
+    else:
+        log("Wazuh API role not found, skipping")
+
+    log(f"Deleting Wazuh API rule 'map_{group_name(tenant)}' ...")
+    all_rules = wazuh("GET", "/security/rules?limit=500")
+    for r in all_rules.get("data", {}).get("affected_items", []):
+        if r.get("name") == f"map_{group_name(tenant)}":
+            wazuh("DELETE", f"/security/rules?rule_ids={r['id']}")
+            ok(f"Wazuh API rule deleted (id={r['id']})")
+            break
+    else:
+        log("Wazuh API rule not found, skipping")
+
+    sep()
+    print(f" Tenant '{tenant}' deleted.")
+    sep()
+    print()
+
+
+# ── list-tenants ──────────────────────────────────────────────
+def list_tenants():
+    sep()
+    print(" Tenants:")
+    sep()
+
+    roles = indexer("GET", "/_plugins/_security/api/roles/")
+    tenants = sorted([
+        tenant_from_role(r)
+        for r in roles
+        if tenant_from_role(r) is not None
+    ])
+
+    if tenants:
+        for t in tenants:
+            rname = role_name(t)
+            mapping = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
+            users = mapping.get(rname, {}).get("users", [])
+            agent_ids = get_agent_ids_for_group(t)
+            user_str = ", ".join(users) if users else "no users"
+            agent_str = ", ".join(agent_ids) if agent_ids else "no agents"
+            print(f"  {t}  (users: {user_str} | agents: {agent_str})")
+    else:
+        print("  No tenants found.")
+    print()
+
+
+# ── list-users ────────────────────────────────────────────────
+def list_users(tenant):
+    sep()
+    print(f" Users in tenant '{tenant}':")
+    sep()
+
+    rname = role_name(tenant)
+    mapping = indexer("GET", f"/_plugins/_security/api/rolesmapping/{rname}")
+    users = mapping.get(rname, {}).get("users", [])
+    if users:
+        for u in users:
+            print(f"  - {u}")
+    else:
+        print("  No users found.")
+    print()
+
+
+# ── enroll-agent ──────────────────────────────────────────────
+def generate_register_ps1(tenant, agent_name, agent_key):
+    """Generate a PowerShell install script for Windows."""
+    v = WAZUH_VERSION
+    m = MANAGER_HOST
+
+    script = f"""# Wazuh agent install script for {agent_name} (tenant: {tenant})
+# One-time use — generated by tenant.py enroll-agent
+# Run in an elevated PowerShell prompt.
+
+$Manager   = "{m}"
+$AgentName = "{agent_name}"
+$AgentKey  = "{agent_key}"
+$Version   = "{v}"
+$MsiUrl    = "https://packages.wazuh.com/4.x/windows/wazuh-agent-$Version-1.msi"
+$MsiPath   = "$env:TEMP\\wazuh-agent.msi"
+
+function Step($msg) {{ Write-Host "  [ ] $msg..." -NoNewline }}
+function Ok($msg)   {{ Write-Host "`r  [+] $msg" }}
+function Fail($msg) {{ Write-Host "`r  [x] $msg"; exit 1 }}
+
+Write-Host ""
+Write-Host "  Wazuh Agent Enrollment"
+Write-Host "  Agent : $AgentName"
+Write-Host "  Server: $Manager"
+Write-Host ""
+
+Step "Downloading Wazuh agent $Version"
+try {{
+    Invoke-WebRequest -Uri $MsiUrl -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    Ok "Downloaded"
+}} catch {{
+    Fail "Download failed: $_"
+}}
+
+Step "Installing Wazuh agent"
+$args = @(
+    "/i", $MsiPath,
+    "/qn",
+    "WAZUH_MANAGER=`"$Manager`"",
+    "WAZUH_AGENT_NAME=`"$AgentName`""
+)
+$p = Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
+if ($p.ExitCode -ne 0) {{ Fail "Installation failed (exit $($p.ExitCode))" }}
+Ok "Agent installed"
+Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+
+Step "Writing client.keys"
+$KeyDecoded = [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String($AgentKey))
+$OssecDirs  = @("C:\\Program Files (x86)\\ossec-agent", "C:\\Program Files\\ossec-agent")
+$OssecDir   = $OssecDirs | Where-Object {{ Test-Path $_ }} | Select-Object -First 1
+if (-not $OssecDir) {{ Fail "ossec-agent directory not found" }}
+[System.IO.File]::WriteAllText("$OssecDir\\client.keys", ($KeyDecoded + "`n"), [System.Text.Encoding]::ASCII)
+Ok "client.keys written"
+
+Step "Starting Wazuh agent service"
+try {{
+    Start-Service -Name "WazuhSvc" -ErrorAction Stop
+    Ok "Agent started"
+}} catch {{
+    Fail "Failed to start service: $_"
+}}
+
+Write-Host ""
+Write-Host "  Enrollment complete! Your system is now being monitored."
+Write-Host ""
+"""
+    return script
+
+
+def generate_register_script(tenant, agent_name, agent_key):
+    """Generate a self-contained OS-aware install script."""
+    v = WAZUH_VERSION
+    m = MANAGER_HOST
+
+    script = f"""#!/bin/sh
+# Wazuh agent install script for {agent_name} (tenant: {tenant})
+# One-time use — generated by tenant.py enroll-agent
+# Run as a normal user with sudo privileges.
+
+MANAGER="{m}"
+AGENT_NAME="{agent_name}"
+AGENT_KEY="{agent_key}"
+VERSION="{v}"
+
+step() {{ echo "  [ ] $1..."; }}
+ok()   {{ echo "  [✓] $1"; }}
+fail() {{ echo "  [✗] $1"; exit 1; }}
+
+echo ""
+echo "  Wazuh Agent Enrollment"
+echo "  Agent : $AGENT_NAME"
+echo "  Server: $MANAGER"
+echo ""
+
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+if [ "$OS" = "Linux" ]; then
+    if [ -f /etc/debian_version ]; then
+        DISTRO="Debian/Ubuntu"
+    elif [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+        DISTRO="RPM"
+    else
+        fail "Unsupported Linux distribution"
+    fi
+    ok "Detected: Linux ($DISTRO, $ARCH)"
+
+    step "Adding Wazuh repository"
+    if [ "$DISTRO" = "Debian/Ubuntu" ]; then
+        curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring \\
+            --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import > /dev/null 2>&1
+        sudo chmod 644 /usr/share/keyrings/wazuh.gpg
+        echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" \\
+            | sudo tee /etc/apt/sources.list.d/wazuh.list > /dev/null
+        sudo apt-get update -qq > /dev/null 2>&1
+    else
+        sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH > /dev/null 2>&1
+        sudo tee /etc/yum.repos.d/wazuh.repo > /dev/null << 'REPO'
+[wazuh]
+gpgcheck=1
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+enabled=1
+name=Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
+REPO
+    fi
+    ok "Repository added"
+
+    step "Installing Wazuh agent $VERSION"
+    if [ "$DISTRO" = "Debian/Ubuntu" ]; then
+        sudo WAZUH_MANAGER="$MANAGER" WAZUH_AGENT_NAME="$AGENT_NAME" \\
+            apt-get install -y -qq wazuh-agent=$VERSION-1 > /dev/null 2>&1 \\
+            || fail "Installation failed"
+    else
+        sudo WAZUH_MANAGER="$MANAGER" WAZUH_AGENT_NAME="$AGENT_NAME" \\
+            yum install -y -q wazuh-agent-$VERSION-1 > /dev/null 2>&1 \\
+            || fail "Installation failed"
+    fi
+    ok "Agent installed"
+
+    step "Importing agent key"
+    echo "y" | sudo /var/ossec/bin/manage_agents -i "$AGENT_KEY" > /dev/null 2>&1 \\
+        || fail "Key import failed"
+    ok "Key imported"
+
+    step "Starting Wazuh agent"
+    sudo systemctl enable wazuh-agent > /dev/null 2>&1
+    sudo systemctl restart wazuh-agent > /dev/null 2>&1 \\
+        || fail "Failed to start agent"
+    ok "Agent started"
+
+elif [ "$OS" = "Darwin" ]; then
+    ok "Detected: macOS ($ARCH)"
+
+    if [ "$ARCH" = "arm64" ]; then
+        PKG="wazuh-agent-$VERSION-1.arm64.pkg"
+    else
+        PKG="wazuh-agent-$VERSION-1.intel64.pkg"
+    fi
+
+    step "Downloading Wazuh agent"
+    curl -s -o /tmp/wazuh-agent.pkg "https://packages.wazuh.com/4.x/macos/$PKG" \\
+        || fail "Download failed"
+    ok "Downloaded"
+
+    step "Installing Wazuh agent"
+    echo "WAZUH_MANAGER='$MANAGER'" > /tmp/wazuh_envs
+    sudo installer -pkg /tmp/wazuh-agent.pkg -target / > /dev/null 2>&1 \\
+        || fail "Installation failed"
+    rm -f /tmp/wazuh-agent.pkg /tmp/wazuh_envs
+    ok "Agent installed"
+
+    step "Importing agent key"
+    echo "y" | sudo /Library/Ossec/bin/manage_agents -i "$AGENT_KEY" > /dev/null 2>&1 \\
+        || fail "Key import failed"
+    ok "Key imported"
+
+    step "Starting Wazuh agent"
+    sudo /Library/Ossec/bin/wazuh-control start > /dev/null 2>&1 \\
+        || fail "Failed to start agent"
+    ok "Agent started"
+
+else
+    fail "Unsupported OS: $OS. For Windows, contact your administrator."
+fi
+
+echo ""
+echo "  Enrollment complete! Your system is now being monitored."
+echo ""
+"""
+    return script
+
+
+def enroll_agent(tenant, agent_name):
+    sep()
+    print(f" Enrolling agent '{agent_name}' for tenant '{tenant}'")
+    sep()
+
+    # 1. Pre-register agent via Wazuh API
+    log(f"Registering agent '{agent_name}' ...")
+    result = wazuh("POST", "/agents", {"name": agent_name})
+
+    if result.get("error") != 0:
+        err(f"Failed to register agent: {result}")
+
+    agent_id  = result["data"]["id"]
+    agent_key = result["data"]["key"]
+    ok(f"Agent registered: id={agent_id}")
+
+    # 2. Assign agent to tenant group
+    log(f"Assigning agent to group '{group_name(tenant)}' ...")
+    result = wazuh("PUT", f"/agents/{agent_id}/group/{group_name(tenant)}")
+    if result.get("error") == 0:
+        ok(f"Agent assigned to group '{group_name(tenant)}'")
+    else:
+        log(f"Note: {result}")
+
+    # 3. Generate install script
+    log("Generating install script ...")
+    script = generate_register_script(tenant, agent_name, agent_key)
+
+    # 4. Save to register directory
+    script_dir = os.path.join(REGISTER_DIR, tenant)
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, agent_name)
+    with open(script_path, 'w') as f:
+        f.write(script)
+    os.chmod(script_path, 0o644)
+    ok(f"Script saved to {script_path}")
+
+    ps1_script = generate_register_ps1(tenant, agent_name, agent_key)
+    ps1_path = script_path + ".ps1"
+    with open(ps1_path, 'w') as f:
+        f.write(ps1_script)
+    os.chmod(ps1_path, 0o644)
+    ok(f"PowerShell script saved to {ps1_path}")
+
+    sep()
+    print(f" Agent '{agent_name}' ready for tenant '{tenant}'.")
+    print()
+    print(f"  Linux/macOS — send this ONE command to the tenant:")
+    print()
+    print(f"  curl -s https://{tenant}.zeroed.nl/register/{agent_name} | bash")
+    print()
+    print(f"  Windows (elevated PowerShell) — send this ONE command to the tenant:")
+    print()
+    print(f"  iex (irm https://{tenant}.zeroed.nl/register/{agent_name})")
+    print()
+    print(f"  The script is OS-aware (Linux Debian/RPM, macOS Intel/Apple Silicon).")
+    print(f"  After the agent connects, run:")
+    print(f"  sudo python3 tenant.py sync-role {tenant}")
+    sep()
+    print()
+
+
+# ── delete-agent ──────────────────────────────────────────────
+def delete_agent(tenant, agent_name):
+    sep()
+    print(f" Deleting pre-registered agent '{agent_name}' for tenant '{tenant}'")
+    sep()
+
+    # Remove script file
+    script_path = os.path.join(REGISTER_DIR, tenant, agent_name)
+    if os.path.exists(script_path):
+        os.remove(script_path)
+        ok(f"Script deleted: {script_path}")
+    else:
+        log(f"No script found at {script_path}")
+
+    # Remove from Wazuh regardless of status
+    log(f"Looking up agent '{agent_name}' in Wazuh ...")
+    result = wazuh("GET", f"/agents?name={agent_name}")
+    agents = result.get("data", {}).get("affected_items", [])
+    if agents:
+        aid = agents[0]["id"]
+        status = agents[0].get("status", "unknown")
+        log(f"Found agent {aid} (status: {status})")
+        # Use appropriate status filter for deletion
+        if status == "never_connected":
+            delete_url = f"/agents?agents_list={aid}&older_than=0s&status=never_connected"
+        else:
+            delete_url = f"/agents?agents_list={aid}&older_than=0s&status={status}"
+        result = wazuh("DELETE", delete_url)
+        if result.get("error") == 0:
+            ok(f"Agent {aid} deleted from Wazuh")
+        else:
+            log(f"Note: {result}")
+    else:
+        log("Agent not found in Wazuh")
+
+    sep()
+    print(f" Done.")
+    sep()
+    print()
+
+# ── Dashboard Template ──────────────────────────────────────────────     
+def import_dashboard_template(tenant):
+    """
+    Prepare and import the Brute Force Detectionboard for a tenant.
+    """
+    sep()
+    print(f" Importing dashboard template for tenant: {tenant}")
+    sep()
+
+    template = os.path.join(
+        TEMPLATE_DIR,
+        "brute-force-detectionboard.ndjson"
+    )
+
+    if not os.path.isfile(template):
+        err(f"Template not found: {template}")
+
+    ok(f"Template found: {template}")
+
+    status = dashboard(
+        "GET",
+        "/api/status",
+        group_name(tenant)
+    )
+
+    if status.get("status", {}).get("overall", {}).get("state") != "green":
+        log(f"Dashboard status response: {status}")
+        err("Dashboard API is not healthy")
+
+    ok("Dashboard API is healthy")
+
+    prepared_template = os.path.join(
+        "/tmp",
+        f"brute-force-detectionboard-{tenant}.ndjson"
+    )
+
+    object_count = 0
+
+    with open(template, "r", encoding="utf-8") as source, \
+            open(prepared_template, "w", encoding="utf-8") as target:
+
+        for line_number, line in enumerate(source, start=1):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                err(
+                    f"Invalid JSON on template line "
+                    f"{line_number}: {exc}"
+                )
+
+            if obj.get("type") in (
+                "index-pattern",
+                "search",
+                "visualization",
+                "dashboard"
+            ):
+                object_count += 1
+
+            target.write(
+                json.dumps(obj, separators=(",", ":")) + "\n"
+            )
+
+    ok(f"Template prepared: {object_count} saved objects") 
+
+    result = dashboard_import_ndjson(
+        tenant,
+        prepared_template
+    )
+
+    try:
+        os.remove(prepared_template)
+    except OSError:
+        pass
+
+    if result.get("success") is True:
+        ok(
+            f"Dashboard imported: "
+            f"{result.get('successCount', object_count)} objects"
+        )
+    else:
+        log(f"Dashboard import response: {result}")
+        err("Dashboard template import failed")
+
+    sep()
+    print(" Dashboard template import complete.")
+    sep()
+    print()
+
+# ── Main ──────────────────────────────────────────────────────
+def usage():
+    print(__doc__)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        usage()
+
+    command = sys.argv[1]
+
+    if command == "create-tenant":
+        if len(sys.argv) != 3: usage()
+        create_tenant(sys.argv[2])
+
+    elif command == "add-user":
+        if len(sys.argv) != 4: usage()
+        add_user(sys.argv[2], sys.argv[3])
+
+    elif command == "remove-user":
+        if len(sys.argv) != 4: usage()
+        remove_user(sys.argv[2], sys.argv[3])
+
+    elif command == "delete-tenant":
+        if len(sys.argv) != 3: usage()
+        delete_tenant(sys.argv[2])
+
+    elif command == "list-tenants":
+        list_tenants()
+
+    elif command == "list-users":
+        if len(sys.argv) != 3: usage()
+        list_users(sys.argv[2])
+
+    elif command == "sync-role":
+        if len(sys.argv) != 3: usage()
+        sync_role(sys.argv[2])
+
+    elif command == "enroll-agent":
+        if len(sys.argv) != 4: usage()
+        enroll_agent(sys.argv[2], sys.argv[3])
+
+    elif command == "delete-agent":
+        if len(sys.argv) != 4: usage()
+        delete_agent(sys.argv[2], sys.argv[3])
+    
+    elif command == "create-sca-index":
+        if len(sys.argv) != 3:
+            usage()
+        create_sca_index(sys.argv[2])
+        
+    elif command == "sync-sca":
+        if len(sys.argv) != 3:
+            usage()
+        sync_sca_permissions(sys.argv[2])
+
+    elif command == "create-sca-dataview":
+        if len(sys.argv) != 3:
+            usage()
+        create_sca_dataview(sys.argv[2])
+
+    else:
+        usage()
