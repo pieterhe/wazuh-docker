@@ -1,0 +1,20 @@
+[indexer]
+url = https://127.0.0.1:9200
+username = admin
+password = changeme
+verify_ssl = false
+
+[wazuh_api]
+url = https://127.0.0.1:55000
+username = wazuh-wui
+password = changeme
+verify_ssl = false
+
+[tenant]
+name = tenant_example
+index_pattern = wazuh-alerts-4.x-tenant_example-*
+
+[report]
+period_start = 2026-01-01T00:00:00Z
+period_end = 2026-02-01T00:00:00Z
+output_dir = output

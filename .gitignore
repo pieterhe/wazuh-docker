@@ -4,3 +4,7 @@ multi-node/config/wazuh_indexer_ssl_certs/*.pem
 multi-node/config/wazuh_indexer_ssl_certs/*.key
 *.log
 **/.env
+**/venv/
+**/__pycache__/
+single-node/scripts/wazuh-reporting/config.ini
+single-node/scripts/wazuh-reporting/output/

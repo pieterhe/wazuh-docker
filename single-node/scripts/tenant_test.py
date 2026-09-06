@@ -76,7 +76,6 @@ import os
 import json
 import subprocess
 import base64
-import requests
 
 
 def _load_dotenv():
