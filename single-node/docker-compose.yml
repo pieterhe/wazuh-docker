@@ -55,15 +55,10 @@ services:
         source: wazuh-dashboard-config
         target: /usr/share/wazuh-dashboard/data/wazuh/config
         volume: {}
-     # - type: volume
-     #   source: wazuh-dashboard-custom
-     #   target: /usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
-     #   volume: {}
-      - type: bind
-        source: /usr/local/ISGservices/wazuh-docker/single-node/config/wazuh_dashboard/branding
+      - type: volume
+        source: wazuh-dashboard-custom
         target: /usr/share/wazuh-dashboard/src/core/server/core_app/assets/custom
-        bind:
-          create_host_path: true
+        volume: {}
 
   wazuh.indexer:
     environment:
