@@ -207,7 +207,11 @@ def update_wazuh_rule_users(tenant, usernames):
     if not rule_id:
         return False, "rule not found"
     values = usernames if usernames else [f"__placeholder_{tenant}__"]
-    result = wazuh("PUT", f"/security/rules/{rule_id}", {"rule": {"FIND": {"user_name": values}}})
+    if len(values) == 1:
+        rule_body = {"FIND": {"user_name": values[0]}}
+    else:
+        rule_body = {"OR": [{"FIND": {"user_name": v}} for v in values]}
+    result = wazuh("PUT", f"/security/rules/{rule_id}", {"rule": rule_body})
     if result.get("error") == 0:
         return True, None
     return False, result
