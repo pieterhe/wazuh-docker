@@ -923,7 +923,8 @@ if [ "$OS" = "Linux" ]; then
 
     step "Adding Wazuh repository"
     if [ "$DISTRO" = "Debian/Ubuntu" ]; then
-        curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring \\
+        sudo mkdir -p /usr/share/keyrings
+        curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-keyring \\
             --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import > /dev/null 2>&1 \\
             || fail "Failed to import Wazuh GPG key"
         sudo chmod 644 /usr/share/keyrings/wazuh.gpg
