@@ -901,16 +901,38 @@ if [ "$OS" = "Linux" ]; then
     fi
     ok "Detected: Linux ($DISTRO, $ARCH)"
 
+    step "Checking dependencies"
+    if [ "$DISTRO" = "Debian/Ubuntu" ]; then
+        NEED=""
+        command -v curl > /dev/null 2>&1 || NEED="$NEED curl"
+        command -v gpg  > /dev/null 2>&1 || NEED="$NEED gnupg"
+        if [ -n "$NEED" ]; then
+            sudo apt-get update -qq > /dev/null 2>&1
+            sudo apt-get install -y -qq $NEED > /dev/null 2>&1 \\
+                || fail "Could not install required packages:$NEED"
+        fi
+    else
+        NEED=""
+        command -v curl > /dev/null 2>&1 || NEED="$NEED curl"
+        if [ -n "$NEED" ]; then
+            sudo yum install -y -q $NEED > /dev/null 2>&1 \\
+                || fail "Could not install required packages:$NEED"
+        fi
+    fi
+    ok "Dependencies present"
+
     step "Adding Wazuh repository"
     if [ "$DISTRO" = "Debian/Ubuntu" ]; then
         curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring \\
-            --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import > /dev/null 2>&1
+            --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import > /dev/null 2>&1 \\
+            || fail "Failed to import Wazuh GPG key"
         sudo chmod 644 /usr/share/keyrings/wazuh.gpg
         echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" \\
             | sudo tee /etc/apt/sources.list.d/wazuh.list > /dev/null
-        sudo apt-get update -qq > /dev/null 2>&1
+        sudo apt-get update -qq > /dev/null 2>&1 || fail "Failed to update package lists"
     else
-        sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH > /dev/null 2>&1
+        sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH > /dev/null 2>&1 \\
+            || fail "Failed to import Wazuh GPG key"
         sudo tee /etc/yum.repos.d/wazuh.repo > /dev/null << 'REPO'
 [wazuh]
 gpgcheck=1
